@@ -1,0 +1,159 @@
+// runner.proto — reconstructed from gitea.com/gitea/actions-proto-go
+//
+// Source repository : https://gitea.com/gitea/actions-proto-go
+// Go module         : gitea.com/gitea/actions-proto-go
+// Transport         : Connect-RPC over HTTP/1.1 or HTTP/2
+// Auth              : header  x-runner-token: <runner_token>
+//
+// For the C++ Haiku port we use the Connect-RPC protocol manually over
+// libcurl (HTTP/1.1), which avoids the gRPC C++ runtime dependency.
+
+syntax = "proto3";
+
+package gitea.actions.v1;
+
+option go_package = "gitea.com/gitea/actions-proto-go/pb;pb";
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared enumerations
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Result mirrors Gitea's internal task/job status codes.
+enum Result {
+  RESULT_UNSPECIFIED = 0;  // Not yet determined / still running
+  RESULT_SUCCESS     = 1;
+  RESULT_FAILURE     = 2;
+  RESULT_CANCELLED   = 3;
+  RESULT_TIMEOUT     = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ping — simple keepalive / liveness probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+message PingRequest {
+  string data = 1;  // runner name or empty — echoed back
+}
+
+message PingResponse {
+  string data = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Register — exchange a registration token for a persistent runner token
+// ─────────────────────────────────────────────────────────────────────────────
+
+message RegisterRequest {
+  // One-time token from POST /api/v1/runners/registration-token
+  string token   = 1;
+  string name    = 2;           // display name in Gitea web UI
+  repeated string labels = 3;  // e.g. ["haiku:host", "haiku-latest:host"]
+  string os      = 4;           // e.g. "haiku"
+  string arch    = 5;           // e.g. "x86_64"
+  string version = 6;           // act_runner version string
+  map<string, string> custom_labels = 7;
+}
+
+message RegisterResponse {
+  string runner_token = 1;  // persistent token — store in .runner file
+  string uuid         = 2;  // server-assigned runner UUID
+  string name         = 3;  // name as confirmed by server
+  repeated string labels = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FetchTask — long-poll for a job to execute
+// ─────────────────────────────────────────────────────────────────────────────
+
+message FetchTaskRequest {
+  repeated string labels  = 1;  // labels this runner can execute
+  int64 tasks_version     = 2;  // optimistic-concurrency version field
+}
+
+message StepContext {
+  string id                    = 1;
+  Result result                = 2;
+  map<string, string> outputs  = 3;
+}
+
+message Task {
+  int64  id               = 1;
+  bytes  workflow_payload = 2;  // raw workflow YAML bytes
+  map<string, string> context = 3;  // github.* context (JSON-encoded values)
+  map<string, string> secrets = 4;  // ${{ secrets.X }} — TLS mandatory!
+  map<string, string> vars    = 5;  // ${{ vars.X }}
+  string gitea_runtime_token  = 6;  // short-lived token for toolkit callbacks
+  repeated StepContext needs_context = 7;
+  int64  timeout          = 8;  // seconds; 0 = server default
+  string machine          = 9;  // machine-readable job name
+}
+
+message FetchTaskResponse {
+  Task   task          = 1;  // absent = nothing to do
+  int64  tasks_version = 2;  // updated version to send on next FetchTask
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateTask — report state transitions during/after job execution
+// ─────────────────────────────────────────────────────────────────────────────
+
+message StepState {
+  int64  id         = 1;  // 1-based step index
+  Result result     = 2;  // UNSPECIFIED while running
+  google.protobuf.Timestamp started_at  = 3;
+  google.protobuf.Timestamp stopped_at  = 4;
+  int64  log_index  = 5;  // first log line for this step (0-based)
+  int64  log_length = 6;  // number of log lines so far
+}
+
+message UpdateTaskRequest {
+  int64  task_id    = 1;
+  Result state      = 2;  // UNSPECIFIED while running; terminal value when done
+  repeated StepState steps = 3;
+  google.protobuf.Timestamp started_at = 4;
+  google.protobuf.Timestamp stopped_at = 5;
+}
+
+message UpdateTaskResponse {
+  int64  task_id = 1;
+  string state   = 2;  // informational; runner typically ignores
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateLog — stream captured log lines back to the server
+// ─────────────────────────────────────────────────────────────────────────────
+
+message LogRow {
+  google.protobuf.Timestamp time = 1;
+  string content = 2;  // UTF-8; may contain ANSI escape sequences
+}
+
+message UpdateLogRequest {
+  int64  task_id  = 1;
+  int64  index    = 2;  // 0-based offset of first row in this batch
+  repeated LogRow rows = 3;
+  bool   no_more  = 4;  // true on final call — server closes log
+}
+
+message UpdateLogResponse {
+  int64 ack_index = 1;  // next expected index; re-send if < index+len(rows)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RunnerService — the primary gRPC / Connect-RPC service
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Connect-RPC endpoint path: POST /gitea.actions.v1.RunnerService/<Method>
+// Auth header (all except Register): x-runner-token: <runner_token>
+// Content-Type: application/proto
+// Body framing: [0x00][4-byte big-endian length][protobuf bytes]
+//
+service RunnerService {
+  rpc Ping(PingRequest)             returns (PingResponse);
+  rpc Register(RegisterRequest)     returns (RegisterResponse);
+  rpc FetchTask(FetchTaskRequest)   returns (FetchTaskResponse);
+  rpc UpdateTask(UpdateTaskRequest) returns (UpdateTaskResponse);
+  rpc UpdateLog(UpdateLogRequest)   returns (UpdateLogResponse);
+}

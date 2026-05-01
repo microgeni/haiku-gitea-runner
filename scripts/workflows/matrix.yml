@@ -1,0 +1,24 @@
+name: matrix
+# Ensures the Gitea server's pre-expansion of matrix combos lands in
+# task.context correctly and that our TaskExecutor surfaces matrix.* in
+# expressions.  Each combination runs as its own task.
+on: [push, workflow_dispatch]
+
+jobs:
+  check:
+    runs-on: [haiku]
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [debug, release]
+        flavour:    [minimal, full]
+        exclude:
+          - build_type: debug
+            flavour:    full
+    steps:
+      - name: Show combination
+        run: |
+          echo "build_type=${{ matrix.build_type }}"
+          echo "flavour=${{ matrix.flavour }}"
+          test "${{ matrix.build_type }}" != ""
+          test "${{ matrix.flavour }}" != ""

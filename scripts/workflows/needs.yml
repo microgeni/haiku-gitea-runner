@@ -1,0 +1,30 @@
+name: needs-and-outputs
+# Two-job DAG: 'build' emits an output via $GITHUB_OUTPUT, 'deploy'
+# consumes it through needs.build.outputs.artifact.  Verifies that
+# TaskDto.needs_context → needs.*.outputs.* wiring works end-to-end.
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: [haiku]
+    outputs:
+      artifact: ${{ steps.make.outputs.artifact }}
+    steps:
+      - id: make
+        run: |
+          ARTIFACT="payload-$(date +%s).hpkg"
+          echo "Built $ARTIFACT"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    runs-on: [haiku]
+    steps:
+      - name: Consume upstream output
+        run: |
+          ART='${{ needs.build.outputs.artifact }}'
+          echo "Deploying: $ART"
+          case "$ART" in
+            payload-*.hpkg) echo "PASS" ;;
+            *) echo "FAIL: unexpected artifact name"; exit 1 ;;
+          esac

@@ -1,0 +1,99 @@
+name: artifact round-trip
+# Exercises the local CacheServer's artifact API (Twirp JSON protocol)
+# by uploading a file in job 'upload' and downloading it in job 'download'.
+# Uses the curl-based artifact API directly (no Node.js required) so the
+# workflow is robust even on Haiku hosts without nodejs installed.
+#
+# Flow:
+#   upload:   create a test payload, POST to CreateArtifact, PUT the blob,
+#             then POST to FinalizeArtifact.
+#   download: POST to GetSignedArtifactURL, GET the blob, verify content.
+#
+# Both jobs access ACTIONS_RESULTS_URL (set by the runner's CacheServer).
+on: [push, workflow_dispatch]
+
+jobs:
+  upload:
+    runs-on: [haiku]
+    steps:
+      - name: Create test payload
+        run: |
+          mkdir -p artifact-payload
+          echo "artifact-content-$(date +%s)" > artifact-payload/data.txt
+          echo "Created: $(cat artifact-payload/data.txt)"
+
+      - name: Upload artifact via Twirp API
+        run: |
+          set -e
+          BASE="${ACTIONS_RESULTS_URL}"
+          if [ -z "$BASE" ]; then
+            echo "ACTIONS_RESULTS_URL not set — skipping artifact test"
+            exit 0
+          fi
+
+          # Strip trailing slash
+          BASE="${BASE%/}"
+
+          # Step 1: CreateArtifact
+          CREATE_RESP=$(curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"workflow_run_backend_id":"1","workflow_job_run_backend_id":"1","name":"smoke-artifact"}' \
+            "${BASE}/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact")
+          echo "CreateArtifact response: $CREATE_RESP"
+          UPLOAD_URL=$(echo "$CREATE_RESP" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('signed_upload_url',''))")
+
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "FAIL: empty signed_upload_url"; exit 1
+          fi
+
+          # Step 2: PUT the blob
+          curl -sS -X PUT \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @artifact-payload/data.txt \
+            "${UPLOAD_URL}"
+
+          # Step 3: FinalizeArtifact
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"workflow_run_backend_id":"1","workflow_job_run_backend_id":"1","name":"smoke-artifact","size":"1"}' \
+            "${BASE}/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact"
+
+          echo "Upload complete."
+
+  download:
+    needs: upload
+    runs-on: [haiku]
+    steps:
+      - name: Download and verify artifact via Twirp API
+        run: |
+          set -e
+          BASE="${ACTIONS_RESULTS_URL}"
+          if [ -z "$BASE" ]; then
+            echo "ACTIONS_RESULTS_URL not set — skipping artifact test"
+            exit 0
+          fi
+          BASE="${BASE%/}"
+
+          # Step 1: GetSignedArtifactURL
+          URL_RESP=$(curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"workflow_run_backend_id":"1","workflow_job_run_backend_id":"1","name":"smoke-artifact"}' \
+            "${BASE}/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL")
+          echo "GetSignedArtifactURL: $URL_RESP"
+          DOWNLOAD_URL=$(echo "$URL_RESP" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('signed_url',''))")
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "FAIL: empty signed_url"; exit 1
+          fi
+
+          # Step 2: GET the blob
+          CONTENT=$(curl -sS "${DOWNLOAD_URL}")
+          echo "Downloaded content: $CONTENT"
+
+          # Step 3: Verify it starts with "artifact-content-"
+          case "$CONTENT" in
+            artifact-content-*) echo "PASS: artifact content verified" ;;
+            *) echo "FAIL: unexpected content: $CONTENT"; exit 1 ;;
+          esac

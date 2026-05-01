@@ -1,0 +1,12 @@
+name: hello
+on: [push, workflow_dispatch]
+jobs:
+  greet:
+    runs-on: [haiku]
+    steps:
+      - name: Say hello
+        run: |
+          echo "Hello from haiku-act-runner!"
+          echo "Runner OS   : ${{ runner.os }}"
+          echo "Runner name : ${{ runner.name }}"
+          uname -a

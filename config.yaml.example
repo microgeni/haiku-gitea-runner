@@ -1,0 +1,64 @@
+# haiku-act-runner configuration file
+# Copy to: /boot/home/config/settings/act_runner/config.yaml
+# (or specify with --config)
+
+# ── Gitea server connection ──────────────────────────────────────────────────
+gitea_url: "https://gitea.example.com"
+
+# ── Runner identity ───────────────────────────────────────────────────────────
+# Display name shown in the Gitea web UI → Settings → Actions → Runners
+# Default: system hostname
+name: "haiku-builder"
+
+# ── Runner labels ─────────────────────────────────────────────────────────────
+# Format: "label-name:executor"
+# On Haiku, only "host" executor is supported (no Docker).
+# These labels must match the "runs-on:" field in your workflow files.
+labels:
+  - "haiku:host"
+  - "haiku-latest:host"
+  - "self-hosted:host"
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# Maximum number of jobs to run concurrently.
+# Start with 1 while testing; increase when confident.
+capacity: 1
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# Long-poll timeout for FetchTask (seconds).
+# The server holds the connection this long if no job is available.
+fetch_timeout: 30
+
+# Delay between successive FetchTask calls when no job is available (seconds).
+fetch_interval: 2
+
+# Set to true only in development environments with self-signed certificates.
+# NEVER use in production.
+insecure: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Log level: "debug" | "info" | "warn" | "error"
+log_level: "info"
+
+# ── Cache server ──────────────────────────────────────────────────────────────
+# Built-in local HTTP server implementing the GitHub Actions cache API
+# (actions/cache@v4).  When enabled the runner advertises it to jobs via
+# ACTIONS_CACHE_URL.  Disable only if you don't use `actions/cache`.
+cache:
+  enabled: true
+  # Storage directory (default: B_USER_SETTINGS_DIRECTORY/act_runner/cache).
+  # dir: "/boot/home/config/settings/act_runner/cache"
+  # Bind host — loopback only by default.  Set to 0.0.0.0 if jobs are run
+  # in containers/VMs that can't reach 127.0.0.1.
+  host: "127.0.0.1"
+  # Desired port.  0 = ephemeral (OS picks).
+  port: 0
+  # Purge cache entries older than this many days at daemon startup.
+  # Prevents unbounded disk growth on long-running runners.
+  # Set to 0 to disable automatic purging.
+  max_age_days: 7
+
+# ── Runner token ──────────────────────────────────────────────────────────────
+# Filled automatically after running: act_runner register
+# Do NOT set this manually — it is written by the registration process.
+runner_token: ""

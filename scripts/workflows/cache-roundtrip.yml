@@ -1,0 +1,40 @@
+name: cache round-trip
+# Exercises the local CacheServer by running two jobs in sequence:
+#   1. 'produce' writes a marker file, saves it to the cache under a
+#      deterministic key.
+#   2. 'consume' restores the cache by the same key and verifies the
+#      marker file's contents.  A cache miss fails the job.
+on: [push, workflow_dispatch]
+
+jobs:
+  produce:
+    runs-on: [haiku]
+    steps:
+      - name: Create marker
+        run: |
+          mkdir -p cache-payload
+          echo "marker-v42-$(date +%s)" > cache-payload/marker.txt
+          cat cache-payload/marker.txt
+
+      - name: Save to cache
+        uses: actions/cache/save@v4
+        with:
+          path: cache-payload
+          key:  smoke-cache-roundtrip-${{ github.sha }}
+
+  consume:
+    needs: produce
+    runs-on: [haiku]
+    steps:
+      - name: Restore from cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: cache-payload
+          key:  smoke-cache-roundtrip-${{ github.sha }}
+
+      - name: Verify payload
+        run: |
+          test "${{ steps.restore.outputs.cache-hit }}" = "true"
+          test -f cache-payload/marker.txt
+          echo "Marker contents: $(cat cache-payload/marker.txt)"
