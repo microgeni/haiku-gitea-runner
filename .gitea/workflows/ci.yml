@@ -304,10 +304,10 @@ jobs:
           chmod 600 ~/.ssh/github_deploy
           ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
           GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
-            git push --force git@github.com:danielbenjaminsson/haiku-gitea-runner.git HEAD:main \
+            git push --force git@github.com:microgeni/haiku-gitea-runner.git HEAD:main \
             || echo "WARNING: GitHub push failed (repo may not exist yet)"
           GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
-            git push git@github.com:danielbenjaminsson/haiku-gitea-runner.git \
+            git push git@github.com:microgeni/haiku-gitea-runner.git \
             v${{ steps.info.outputs.version }} \
             || echo "WARNING: GitHub tag push failed"
           rm -f ~/.ssh/github_deploy
@@ -329,11 +329,11 @@ jobs:
 
           EXISTING_ID=$(curl -s \
             -H "Authorization: token $GH_RELEASE_TOKEN" \
-            "https://api.github.com/repos/danielbenjaminsson/haiku-gitea-runner/releases/tags/$TAG" \
+            "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases/tags/$TAG" \
             | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
           if [ -n "$EXISTING_ID" ]; then
             curl -s -X DELETE -H "Authorization: token $GH_RELEASE_TOKEN" \
-              "https://api.github.com/repos/danielbenjaminsson/haiku-gitea-runner/releases/$EXISTING_ID"
+              "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases/$EXISTING_ID"
             sleep 2
           fi
 
@@ -347,7 +347,7 @@ jobs:
             -H "Authorization: token $GH_RELEASE_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD" \
-            "https://api.github.com/repos/danielbenjaminsson/haiku-gitea-runner/releases")
+            "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases")
 
           UPLOAD_URL=$(echo "$RELEASE_RESPONSE" \
             | python3 -c "import sys,json; print(json.load(sys.stdin).get('upload_url','').split('{')[0])" \
