@@ -24,6 +24,11 @@ ContextBuilder& ContextBuilder::withRunnerInfo(const std::string& name,
     return *this;
 }
 
+ContextBuilder& ContextBuilder::withWorkDir(const std::string& work_dir) {
+    work_dir_ = work_dir;
+    return *this;
+}
+
 ContextBuilder& ContextBuilder::withJobEnv(const std::map<std::string,std::string>& env) {
     job_env_ = env;
     return *this;
@@ -96,8 +101,8 @@ ExprContext ContextBuilder::build() const {
     ctx.setString("runner.name",  runner_name_.empty() ? "haiku-runner" : runner_name_);
     ctx.setString("runner.os",    runner_os_.empty()   ? "haiku"        : runner_os_);
     ctx.setString("runner.arch",  runner_arch_.empty() ? "X64"          : runner_arch_);
-    ctx.setString("runner.temp",  "/tmp");
-    ctx.setString("runner.tool_cache", "/tmp/tool_cache");
+    ctx.setString("runner.temp",  work_dir_.empty() ? "/tmp" : work_dir_ + "/tmp");
+    ctx.setString("runner.tool_cache", work_dir_.empty() ? "/tmp/tool_cache" : work_dir_ + "/tool_cache");
 
     // github.token — the Gitea runtime token that actions use for API calls.
     // Exposed as ${{ github.token }} (the canonical reference in published actions).

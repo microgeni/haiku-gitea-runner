@@ -15,7 +15,8 @@ StepRunner::StepRunner(std::string workspace_dir,
                        std::string default_shell,
                        ActionCache* action_cache,
                        std::string gitea_url,
-                       std::string default_actions_url)
+                       std::string default_actions_url,
+                       std::string actions_cache_dir)
     : workspace_dir_(std::move(workspace_dir))
     , default_shell_(default_shell.empty() ? "/bin/sh" : std::move(default_shell))
     , gitea_url_(std::move(gitea_url))
@@ -26,7 +27,12 @@ StepRunner::StepRunner(std::string workspace_dir,
     if (action_cache) {
         action_cache_ = action_cache;
     } else {
-        owned_cache_ = std::make_unique<ActionCache>("/tmp/act_runner_actions");
+        // Use provided cache dir, fall back to a subdir of the workspace, then /tmp.
+        std::string cache_dir = actions_cache_dir.empty()
+                              ? (workspace_dir_.empty() ? "/tmp/act_runner_actions"
+                                                        : workspace_dir_ + "/../act_runner_actions")
+                              : actions_cache_dir;
+        owned_cache_ = std::make_unique<ActionCache>(cache_dir);
         action_cache_ = owned_cache_.get();
     }
 }

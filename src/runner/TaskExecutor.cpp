@@ -337,6 +337,7 @@ bool TaskExecutor::execute() {
     ctx_builder
         .withTask(task_)
         .withRunnerInfo(cfg_.name)
+        .withWorkDir(cfg_.work_dir)
         .withJobEnv(job_env_map);
 
     // ── Extract matrix combination (if any) ──────────────────────────
@@ -414,10 +415,16 @@ bool TaskExecutor::execute() {
     }
 
     // ── Step runner ────────────────────────────────────────────────────
+    // actions_cache_dir: shared across all jobs on this runner so that
+    // downloaded actions (e.g. actions/checkout) are cached between runs.
+    std::string actions_cache_dir = cfg_.work_dir.empty()
+                                  ? "/tmp/act_runner_actions"
+                                  : cfg_.work_dir + "/act_runner_actions";
     StepRunner step_runner(workspace, default_shell,
                            /*action_cache=*/nullptr,
                            cfg_.gitea_url,
-                           default_actions_url);
+                           default_actions_url,
+                           actions_cache_dir);
 
     // Register this step_runner so cancel() can interrupt a running step.
     active_step_runner_.store(&step_runner);

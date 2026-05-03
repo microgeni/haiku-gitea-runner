@@ -34,11 +34,13 @@ public:
     /// @param action_cache        action cache for 'uses:' steps
     /// @param gitea_url           Gitea URL (fallback for fetching actions)
     /// @param default_actions_url Primary URL for remote actions (e.g. "https://github.com")
+    /// @param actions_cache_dir   directory for the owned ActionCache (default: work_dir/actions_cache)
     StepRunner(std::string workspace_dir,
                std::string default_shell,
                ActionCache* action_cache = nullptr,
                std::string gitea_url = "",
-               std::string default_actions_url = "https://github.com");
+               std::string default_actions_url = "https://github.com",
+               std::string actions_cache_dir = "");
 
     /// Execute one step.
     ///
