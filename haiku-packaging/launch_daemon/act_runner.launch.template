@@ -1,0 +1,16 @@
+service x-vnd.act-runner {
+	# Gitea Actions runner — starts automatically when network is available.
+	# Register first:  act_runner register --url https://your.gitea --token <token>
+	launch @BIN@ daemon
+	working_directory /boot/home/config/settings/act_runner
+	env {
+		HOME /boot/home
+	}
+	on {
+		network_available
+	}
+	require {
+		file /boot/home/config/settings/act_runner/config.yaml
+	}
+	no_safemode
+}

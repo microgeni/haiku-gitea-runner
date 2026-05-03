@@ -3,6 +3,11 @@
 //
 // Background thread drains a thread-safe queue and calls UpdateLog
 // in batches.  Supports the idempotent ack_index re-delivery protocol.
+//
+// Secret registration: pass initial secrets to the constructor so they are
+// loaded BEFORE the worker thread starts.  This prevents a window where the
+// worker could call maskSecrets() on the first log line before the caller has
+// had a chance to call addSecret().
 
 #include "../client/IRunnerClient.h"
 
@@ -32,16 +37,19 @@ using LogCallback = std::function<void(const LogLine&)>;
 /// Thread-safe log queue + background UpdateLog sender.
 class LogForwarder {
 public:
-    /// @param client         RunnerClient to call UpdateLog on
-    /// @param task_id        task this forwarder is associated with
-    /// @param batch_size     max lines per UpdateLog call
+    /// @param client             RunnerClient to call UpdateLog on
+    /// @param task_id            task this forwarder is associated with
+    /// @param batch_size         max lines per UpdateLog call
     /// @param flush_interval_ms  flush queue at least this often (ms)
-    /// @param local_cb       optional callback for console output
+    /// @param local_cb           optional callback for console output
+    /// @param initial_secrets    secret values to mask — loaded before the
+    ///                           worker thread starts so no masking window exists
     LogForwarder(IRunnerClient& client,
                  int64_t        task_id,
-                 size_t         batch_size       = 50,
-                 int            flush_interval_ms = 1000,
-                 LogCallback    local_cb          = nullptr);
+                 size_t         batch_size        = 50,
+                 int            flush_interval_ms  = 1000,
+                 LogCallback    local_cb           = nullptr,
+                 std::vector<std::string> initial_secrets = {});
 
     ~LogForwarder();
 
@@ -68,7 +76,8 @@ public:
 
     /// Register a secret value to be masked in all log output.
     /// Each occurrence of @p value in a log line is replaced with "***".
-    /// Thread-safe; call before the first append() for safety.
+    /// Thread-safe.  Prefer passing secrets via the constructor for guaranteed
+    /// masking from the very first log line.
     void addSecret(const std::string& value);
 
 private:

@@ -5,9 +5,10 @@
 //   poll_thread_: calls FetchTask repeatedly; dispatches tasks
 //   ping_thread_: periodic keepalive Ping every 30 s
 //
-// Task threads are DETACHED after dispatch.  An atomic counter tracks
-// the number of in-flight tasks; join() waits for it to reach zero.
-// The capacity counting_semaphore limits concurrent task count cleanly.
+// Tasks are dispatched to a fixed thread pool of long-lived worker threads.
+// This avoids the Haiku TLS destructor race that occurs when short-lived
+// detached threads exit while libcurl/OpenSSL per-thread state is still
+// being torn down (race between pthread_exit and TLS key destructors).
 
 #include "../client/IRunnerClient.h"
 #include "../config/Config.h"
@@ -18,6 +19,10 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
+#include <optional>
+#include <functional>
+#include <vector>
 
 namespace runner {
 
@@ -32,7 +37,7 @@ public:
     Poller(const Poller&)            = delete;
     Poller& operator=(const Poller&) = delete;
 
-    /// Start poll + ping background threads.
+    /// Start poll + ping background threads + worker pool.
     void start();
 
     /// Signal graceful shutdown (non-blocking).
@@ -58,21 +63,31 @@ private:
     std::thread         ping_thread_;
 
     // Capacity: blocks dispatch when all slots are in use.
-    // Max template argument must be a compile-time constant ≥ cfg_.capacity.
+    // Max template argument must be a compile-time constant >= cfg_.capacity.
     std::counting_semaphore<16> capacity_sem_;
 
-    // Counts detached task threads currently alive.
+    // Counts tasks currently executing.
     std::atomic<int>            active_tasks_{0};
     std::mutex                  active_mutex_;
-    std::condition_variable     active_cv_;   // notified when active_tasks_ → 0
+    std::condition_variable     active_cv_;   // notified when active_tasks_ -> 0
 
-    int64_t tasks_version_ = 0;
+    // Worker thread pool — long-lived threads that avoid the Haiku
+    // detached-thread TLS destructor crash with libcurl/OpenSSL.
+    struct WorkItem {
+        TaskDto task;
+    };
+    std::queue<WorkItem>        work_queue_;
+    std::mutex                  work_mutex_;
+    std::condition_variable     work_cv_;
+    std::vector<std::thread>    workers_;
+
+    std::atomic<int64_t> tasks_version_{0};
 
     void pollLoop();
     void pingLoop();
+    void workerLoop();  // thread-pool worker body
 
-    /// Detach a task thread; active_tasks_ is incremented before detach,
-    /// decremented (and active_cv_ notified) when the thread body returns.
+    /// Enqueue a task for execution by a pool worker.
     void dispatchTask(TaskDto task);
 };
 

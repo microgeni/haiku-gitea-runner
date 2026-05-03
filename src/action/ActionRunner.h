@@ -104,11 +104,14 @@ public:
                                       const std::string& ref) const;
 
     /// Download and cache an action. Returns the cache path.
+    /// Tries default_actions_url (e.g. https://github.com) first, then
+    /// gitea_url as fallback for actions mirrored on the Gitea instance.
     /// @throws std::runtime_error on download failure
     std::filesystem::path fetchAction(const std::string& owner,
                                        const std::string& repo,
                                        const std::string& ref,
-                                       const std::string& gitea_url);
+                                       const std::string& gitea_url,
+                                       const std::string& default_actions_url = "");
 
 private:
     std::filesystem::path cache_root_;
@@ -124,14 +127,16 @@ private:
 /// Resolves and executes 'uses:' action steps.
 class ActionRunner {
 public:
-    /// @param workspace_dir   job workspace root
-    /// @param cache           action cache (shared across steps in a job)
-    /// @param default_shell   shell to use for composite action run: steps
-    /// @param gitea_url       Gitea server URL (for fetching actions)
+    /// @param workspace_dir        job workspace root
+    /// @param cache                action cache (shared across steps in a job)
+    /// @param default_shell        shell to use for composite action run: steps
+    /// @param gitea_url            Gitea server URL (fallback for fetching actions)
+    /// @param default_actions_url  Primary URL for fetching actions (e.g. "https://github.com")
     ActionRunner(std::filesystem::path workspace_dir,
                  ActionCache&          cache,
                  std::string           default_shell,
-                 std::string           gitea_url);
+                 std::string           gitea_url,
+                 std::string           default_actions_url = "https://github.com");
 
     /// Execute a 'uses:' step.
     /// If the action has a post: script, it is appended to *post_queue
@@ -161,6 +166,7 @@ private:
     ActionCache&          cache_;
     std::string           default_shell_;
     std::string           gitea_url_;
+    std::string           default_actions_url_;
 
     /// Resolve a 'uses:' reference to a local directory containing action.yml
     std::filesystem::path resolveActionDir(

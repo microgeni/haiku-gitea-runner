@@ -44,6 +44,10 @@ public:
     /// Call after registration.
     void setRunnerToken(std::string token) override;
 
+    /// Set the runner UUID (from RegisterResult::uuid). Must be called after
+    /// registration — Gitea requires x-runner-uuid on every RPC call.
+    void setRunnerUUID(std::string uuid);
+
     // ── RPCs ────────────────────────────────────────────────────────────────
 
     PingResult ping(const std::string& data = "") override;
@@ -54,6 +58,12 @@ public:
         const std::vector<std::string>& labels,
         const std::string& os      = "haiku",
         const std::string& arch    = "x86_64",
+        const std::string& version = "0.1.0-haiku"
+    ) override;
+
+    /// Declare version + labels after registration so Gitea stores them.
+    RegisterResult declare(
+        const std::vector<std::string>& labels,
         const std::string& version = "0.1.0-haiku"
     ) override;
 
@@ -72,7 +82,8 @@ public:
         int     state,          // Result enum value
         const std::vector<StepStateDto>& steps,
         int64_t started_at_s = 0,
-        int64_t stopped_at_s = 0
+        int64_t stopped_at_s = 0,
+        const std::vector<std::pair<std::string,std::string>>& outputs = {}
     ) override;
 
     UpdateLogResult updateLog(

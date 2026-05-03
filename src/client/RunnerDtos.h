@@ -32,15 +32,22 @@ struct StepContextDto {
     std::vector<std::pair<std::string,std::string>> outputs;
 };
 
+// Mirrors TaskNeed { map<string,string> outputs=1; Result result=2; }
+struct NeedsContextEntry {
+    std::vector<std::pair<std::string,std::string>> outputs;
+    int result = 0;  // Result enum
+};
+
 struct TaskDto {
     int64_t id = 0;
     std::string workflow_payload;   // raw YAML bytes
-    std::vector<std::pair<std::string,std::string>> context;   // github.* context
+    std::vector<std::pair<std::string,std::string>> context;   // github.* context (from Struct)
     std::vector<std::pair<std::string,std::string>> secrets;
     std::vector<std::pair<std::string,std::string>> vars;
-    std::string gitea_runtime_token;
-    std::vector<StepContextDto> needs_context;
-    int64_t timeout = 0;   // seconds
+    std::string gitea_runtime_token;  // populated from context["gitea_runtime_token"] if present
+    // needs_context: job_name → NeedsContextEntry (outputs + result of dependency)
+    std::vector<std::pair<std::string,NeedsContextEntry>> needs_context;
+    int64_t timeout = 0;   // seconds (unused in server proto, kept for local use)
     std::string machine;
 };
 

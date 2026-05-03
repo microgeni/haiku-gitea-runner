@@ -14,15 +14,18 @@ namespace fs = std::filesystem;
 StepRunner::StepRunner(std::string workspace_dir,
                        std::string default_shell,
                        ActionCache* action_cache,
-                       std::string gitea_url)
+                       std::string gitea_url,
+                       std::string default_actions_url)
     : workspace_dir_(std::move(workspace_dir))
     , default_shell_(default_shell.empty() ? "/bin/sh" : std::move(default_shell))
     , gitea_url_(std::move(gitea_url))
+    , default_actions_url_(default_actions_url.empty()
+                           ? "https://github.com"
+                           : std::move(default_actions_url))
 {
     if (action_cache) {
         action_cache_ = action_cache;
     } else {
-        // Create a default action cache in /tmp
         owned_cache_ = std::make_unique<ActionCache>("/tmp/act_runner_actions");
         action_cache_ = owned_cache_.get();
     }
@@ -223,7 +226,8 @@ StepRunResult StepRunner::runAction(
     std::vector<PostScript>* post_queue)
 {
     ActionRunner action_runner(workspace_dir_, *action_cache_,
-                                default_shell_, gitea_url_);
+                                default_shell_, gitea_url_,
+                                default_actions_url_);
 
     // We need base_env here — rebuild it from env_mgr's current env
     auto base_env = env_mgr.currentEnv();

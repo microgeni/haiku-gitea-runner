@@ -38,8 +38,14 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <exception>
+#include <setjmp.h>   // sigjmp_buf, siglongjmp
 #include <unistd.h>
+#include <sys/wait.h> // waitpid
+#include <mutex>
 #include <curl/curl.h>
+
+extern char** environ;  // current process environment (used by watchdog)
 
 #ifdef __HAIKU__
 #  include <FindDirectory.h>
@@ -53,6 +59,42 @@ static std::atomic<bool> g_shutdown{false};
 static void signal_handler(int /*sig*/) {
     g_shutdown.store(true);
 }
+
+// Signal handler for Haiku-internal signals (SIGTRAP=5 from load_image,
+// SIGUSR2=12 from the debug server) that would otherwise kill the daemon.
+// We simply return so the daemon continues running.
+// SIGSEGV handler: longjmp out of the faulting task execution.
+// Both run on the alternate signal stack (SA_ONSTACK).
+
+// Thread-local recovery point for worker threads — defined in Poller.cpp,
+// used by benign_signal_handler to siglongjmp back to the workerLoop boundary.
+extern thread_local sigjmp_buf t_task_recover;
+extern thread_local volatile bool t_in_task;
+
+// Signal handler for Haiku-internal signals (SIGCHLD=5 from load_image children
+// exiting, SIGTRAP=22 from the debug server) that would otherwise kill the daemon.
+// SIGSEGV/SIGBUS inside a task: recovered via siglongjmp back to workerLoop.
+// SIGSEGV/SIGBUS outside a task: re-raised with default action (crash).
+// Runs on the alternate signal stack (SA_ONSTACK).
+static void benign_signal_handler(int sig) {
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        if (t_in_task) {
+            // Recover: jump back to the worker loop boundary.
+            siglongjmp(t_task_recover, sig);
+        }
+        // Not in a task — reinstall default and re-raise for a real crash.
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    // All other signals: swallow and continue.
+    // On Haiku:
+    //   signal 5  = SIGCHLD (child process exited via load_image)
+    //   signal 12 = SIGCONT (continue — harmless)
+    //   signal 22 = SIGTRAP (from debug_server on new-team creation)
+    // We silently ignore them so the daemon keeps running.
+}
+
 
 // ─── Version ──────────────────────────────────────────────────────────────
 
@@ -127,6 +169,7 @@ struct Args {
     bool insecure = false;
     // daemon / run
     std::string log_level;
+    bool watchdog_child = false;  // internal: set when spawned by the watchdog wrapper
     // run
     std::string workflow_file;
     std::string event_name;
@@ -142,13 +185,27 @@ static Args parseArgs(int argc, char* argv[]) {
         args.implicit_help = true;
         return args;
     }
-    args.command = argv[1];
+
+    // Accept 'help' and '--help'/'-h' as the first argument.
+    std::string first = argv[1];
+    if (first == "--help" || first == "-h") {
+        args.command = "help";
+        return args;
+    }
+    args.command = first;
 
     // The first positional argument after "run" is the workflow file.
     bool first_positional = (args.command == "run");
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
+
+        // --help / -h anywhere on the command line → show help and exit 0.
+        if (a == "--help" || a == "-h") {
+            args.command = "help";
+            args.implicit_help = false;
+            return args;
+        }
 
         // First positional (non-flag) for the run subcommand is the workflow file.
         if (first_positional && a[0] != '-') {
@@ -162,13 +219,14 @@ static Args parseArgs(int argc, char* argv[]) {
             throw std::runtime_error("Expected argument after " + a);
         };
 
-        if      (a == "--config")    args.config_path   = nextArg();
-        else if (a == "--url")       args.url            = nextArg();
-        else if (a == "--token")     args.reg_token      = nextArg();
-        else if (a == "--name")      args.name           = nextArg();
-        else if (a == "--insecure")  args.insecure       = true;
-        else if (a == "--log-level") args.log_level      = nextArg();
-        else if (a == "--event")     args.event_name     = nextArg();
+        if      (a == "--config")       args.config_path      = nextArg();
+        else if (a == "--url")          args.url               = nextArg();
+        else if (a == "--token")        args.reg_token         = nextArg();
+        else if (a == "--name")         args.name              = nextArg();
+        else if (a == "--insecure")     args.insecure          = true;
+        else if (a == "--log-level")    args.log_level         = nextArg();
+        else if (a == "--watchdog-child") args.watchdog_child  = true;
+        else if (a == "--event")        args.event_name        = nextArg();
         else if (a == "--payload")   args.event_payload  = nextArg();
         else if (a == "--job")       args.job_filter     = nextArg();
         else if (a == "--retry") {
@@ -261,6 +319,26 @@ static int cmdRegister(const Args& args) {
         return 1;
     }
 
+    // Declare version + labels so Gitea stores them server-side for task routing.
+    // (Required by Gitea 1.21+; the runner token from Register is used here.)
+    // Declare takes plain label names (e.g. "haiku"), not "name:type" strings.
+    rpc_client.setRunnerToken(reg.runner_token);
+    rpc_client.setRunnerUUID(reg.uuid);
+    {
+        std::vector<std::string> declare_labels;
+        for (auto& l : label_strings) {
+            auto pos = l.find(':');
+            declare_labels.push_back(pos == std::string::npos ? l : l.substr(0, pos));
+        }
+        try {
+            rpc_client.declare(declare_labels);
+            LOG_INFO("register", "Declare OK");
+        } catch (const std::exception& e) {
+            // Non-fatal — older Gitea versions may not have Declare.
+            LOG_WARN("register", "Declare RPC failed (non-fatal): " << e.what());
+        }
+    }
+
     runner::RunnerState state;
     state.token  = reg.runner_token;
     state.uuid   = reg.uuid;
@@ -293,6 +371,160 @@ static int cmdRegister(const Args& args) {
 }
 
 // ─── Daemon subcommand ────────────────────────────────────────────────────
+
+// ── Watchdog wrapper ───────────────────────────────────────────────────────
+// When invoked as "daemon" (without --watchdog-child), cmdDaemon forks a
+// child that runs the actual daemon loop, and acts as a watchdog that
+// restarts the child on unexpected exit.  SIGTERM/SIGINT are forwarded to
+// the child; if the child exits cleanly (exit 0) the watchdog exits too.
+//
+// This means the daemon is self-healing even when not managed by
+// launch_daemon: if the daemon crashes (e.g. due to SIGKILLTHR), the
+// watchdog notices within 1 s and re-execs it automatically.
+//
+// Child processes are spawned via execv() to inherit the same binary and
+// all arguments, with --watchdog-child appended.
+
+static pid_t g_watchdog_child_pid = -1;
+
+static void watchdog_signal_handler(int sig) {
+    // Forward the signal to the child, then set our own shutdown flag.
+    if (g_watchdog_child_pid > 0) kill(g_watchdog_child_pid, sig);
+    g_shutdown.store(true);
+}
+
+static int runWatchdog(int argc, char* argv[]) {
+    // Build the child argv: copy original argv + "--watchdog-child"
+    std::vector<char*> child_argv(argv, argv + argc);
+    const char* wc_flag = "--watchdog-child";
+    child_argv.push_back(const_cast<char*>(wc_flag));
+    child_argv.push_back(nullptr);
+
+    // Pre-flight: if config doesn't exist, exit immediately with code 1
+    // (same as the child would do). This avoids restart loops when not registered.
+    {
+        Args a;
+        try { a = parseArgs(argc, argv); } catch (...) {}
+        std::string cfg_path = a.config_path.empty()
+                               ? runner::defaultConfigPath()
+                               : a.config_path;
+        if (!std::filesystem::exists(cfg_path)) {
+            std::cerr << "Config file not found: " << cfg_path << "\n"
+                      << "Run 'act_runner register --url <gitea_url> --token <token>' first.\n";
+            return 1;
+        }
+    }
+
+    // Install our signal handlers on the watchdog side
+    struct sigaction sa{};
+    sa.sa_handler = watchdog_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    // Ignore SIGCHLD so we can waitpid() explicitly
+    signal(SIGCHLD, SIG_DFL);
+
+    int restart_delay_s = 0;
+    int attempts = 0;
+
+    while (!g_shutdown.load()) {
+        if (restart_delay_s > 0) {
+            LOG_INFO("watchdog", "Restarting daemon in " << restart_delay_s << "s"
+                     << " (attempt " << attempts << ")");
+            for (int i = 0; i < restart_delay_s && !g_shutdown.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (g_shutdown.load()) break;
+        }
+
+#ifdef __HAIKU__
+        // On Haiku use load_image() to avoid the posix_spawn SIGKILLTHR race
+        {
+            static std::mutex s_exec_mutex;
+            std::lock_guard<std::mutex> lk(s_exec_mutex);
+
+            // Temporarily dup stdout/stderr to /dev/null for the brief window
+            // between load_image and resume — the child inherits the real fds.
+            thread_id child_tid = ::load_image(
+                static_cast<int>(child_argv.size() - 1),
+                const_cast<const char**>(child_argv.data()),
+                const_cast<const char**>(environ)
+            );
+            if (child_tid < B_OK) {
+                LOG_ERROR("watchdog", "load_image() failed: " << strerror((int)-child_tid));
+                restart_delay_s = std::min(restart_delay_s + 5, 60);
+                ++attempts;
+                continue;
+            }
+            ::setpgid(static_cast<pid_t>(child_tid), 0);
+            g_watchdog_child_pid = static_cast<pid_t>(child_tid);
+            ::resume_thread(child_tid);
+        }
+#else
+        {
+            pid_t pid = fork();
+            if (pid == 0) {
+                // Child
+                execv("/proc/self/exe", child_argv.data());
+                execv(child_argv[0], child_argv.data());
+                _exit(127);
+            }
+            if (pid < 0) {
+                LOG_ERROR("watchdog", "fork() failed: " << strerror(errno));
+                restart_delay_s = std::min(restart_delay_s + 5, 60);
+                ++attempts;
+                continue;
+            }
+            g_watchdog_child_pid = pid;
+        }
+#endif
+
+        LOG_INFO("watchdog", "Daemon child started (pid " << g_watchdog_child_pid << ")");
+
+        // Wait for the child to exit
+        int wstatus = 0;
+        while (true) {
+            pid_t reaped = waitpid(g_watchdog_child_pid, &wstatus, WNOHANG);
+            if (reaped == g_watchdog_child_pid) break;
+            if (g_shutdown.load()) {
+                // Give child 10s to finish gracefully
+                for (int i = 0; i < 10 && kill(g_watchdog_child_pid, 0) == 0; ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                kill(g_watchdog_child_pid, SIGKILL);
+                waitpid(g_watchdog_child_pid, &wstatus, 0);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        g_watchdog_child_pid = -1;
+
+        if (g_shutdown.load()) break;
+
+        int exit_code = 0;
+        bool crashed  = false;
+        if (WIFEXITED(wstatus)) {
+            exit_code = WEXITSTATUS(wstatus);
+            if (exit_code == 0) {
+                LOG_INFO("watchdog", "Daemon exited cleanly — stopping watchdog.");
+                return 0;
+            }
+            LOG_WARN("watchdog", "Daemon exited with code " << exit_code << " — will restart.");
+            crashed = true;
+        } else if (WIFSIGNALED(wstatus)) {
+            int sig = WTERMSIG(wstatus);
+            LOG_WARN("watchdog", "Daemon killed by signal " << sig << " — will restart.");
+            crashed = true;
+        }
+
+        if (crashed) {
+            ++attempts;
+            // Exponential-ish backoff: 2, 4, 8 … capped at 30s
+            restart_delay_s = std::min(2 << std::min(attempts, 4), 30);
+        }
+    }
+
+    return 0;
+}
 
 static int cmdDaemon(const Args& args) {
     std::string config_path = args.config_path.empty()
@@ -356,6 +588,7 @@ static int cmdDaemon(const Args& args) {
         for (auto& l : state.labels) { if (!lbls.empty()) lbls += ' '; lbls += l; }
         LOG_INFO("main", "Labels    : " << lbls);
     }
+    LOG_INFO("main", "Work dir  : " << (cfg.work_dir.empty() ? "/tmp (default)" : cfg.work_dir));
 
     // Signal handlers
     struct sigaction sa{};
@@ -364,8 +597,41 @@ static int cmdDaemon(const Args& args) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Install terminate handler to diagnose uncaught exceptions in threads.
+    // Install an alternate signal stack and handle Haiku-internal signals.
+    // See benign_signal_handler() above for the full list of handled signals.
+    {
+        // Alternate signal stack (64 KB) for the signal handler.
+        static char sigstack_buf[65536];
+        stack_t ss{};
+        ss.ss_sp    = sigstack_buf;
+        ss.ss_size  = sizeof(sigstack_buf);
+        ss.ss_flags = 0;
+        sigaltstack(&ss, nullptr);
+
+        struct sigaction ca{};
+        ca.sa_handler = benign_signal_handler;
+        sigemptyset(&ca.sa_mask);
+        ca.sa_flags = SA_ONSTACK;  // run on alternate stack
+
+        // Install handlers for the Haiku-internal and recoverable signals.
+        sigaction(SIGTRAP,  &ca, nullptr);  // 22 — from debug_server
+        sigaction(SIGUSR2,  &ca, nullptr);  // 19 — user-defined (Haiku)
+        sigaction(SIGSEGV,  &ca, nullptr);  // 11 — recoverable via siglongjmp
+        sigaction(SIGBUS,   &ca, nullptr);  // 30 — recoverable via siglongjmp
+
+        // SIGCHLD (5 on Haiku): use SIG_IGN to discard child-exit
+        // notifications automatically without running our handler.
+        // This avoids any race in the handler when load_image() children exit.
+        struct sigaction ign{};
+        ign.sa_handler = SIG_IGN;
+        sigemptyset(&ign.sa_mask);
+        sigaction(SIGCHLD, &ign, nullptr);  // 5 on Haiku
+    }
+
     runner::RunnerClient client(cfg.gitea_url, cfg.insecure);
     client.setRunnerToken(state.token);
+    client.setRunnerUUID(state.uuid);
 
     LOG_INFO("daemon", "Connecting to " << cfg.gitea_url << " ...");
     try {
@@ -374,6 +640,24 @@ static int cmdDaemon(const Args& args) {
     } catch (const std::exception& e) {
         LOG_WARN("daemon", "Initial ping failed: " << e.what()
                  << " — will retry during polling");
+    }
+
+    // Declare labels to Gitea so it routes tasks to this runner.
+    // Declare uses plain label names (strip ":type" suffix from stored labels).
+    {
+        const auto& stored_labels = state.labels;
+        std::vector<std::string> declare_labels;
+        for (auto& l : stored_labels) {
+            auto pos = l.find(':');
+            declare_labels.push_back(pos == std::string::npos ? l : l.substr(0, pos));
+        }
+        try {
+            client.declare(declare_labels);
+            LOG_INFO("daemon", "Declared labels to Gitea: "
+                     << [&]{ std::string s; for(auto& l:declare_labels){s+=l+' ';}; return s; }());
+        } catch (const std::exception& e) {
+            LOG_WARN("daemon", "Declare failed (non-fatal): " << e.what());
+        }
     }
 
 #ifdef HAVE_MICROHTTPD
@@ -575,6 +859,16 @@ static int cmdRun(const Args& args) {
     LOG_INFO("run", "Executing workflow '" << wf.name << "' locally");
     LOG_INFO("run", "Event: " << event_name << "  Jobs: " << wf.jobs.size());
 
+    // Warn if the declared 'on:' triggers don't include the requested event.
+    // This is advisory only — allow the run to proceed (useful for manual testing).
+    if (!wf.triggers.empty() && !wf.triggeredBy(event_name)) {
+        std::cerr << "[WARNING] Workflow '" << wf.name << "' does not declare '"
+                  << event_name << "' in its 'on:' triggers.\n"
+                  << "         Declared events:";
+        for (auto& [ev, _] : wf.triggers) std::cerr << " " << ev;
+        std::cerr << "\n         Proceeding anyway (use --event to match a declared event).\n";
+    }
+
     runner::WorkflowOrchestrator orchestrator(local_client, cfg);
 
     // Cancel via SIGINT/SIGTERM
@@ -676,6 +970,7 @@ static int cmdUnregister(const Args& args) {
         LOG_INFO("unregister", "Contacting " << cfg.gitea_url << " to remove runner...");
         runner::RunnerClient client(cfg.gitea_url, cfg.insecure);
         client.setRunnerToken(state.token);
+        client.setRunnerUUID(state.uuid);
 
         // The Gitea Actions API allows a runner to delete itself via:
         //   DELETE /api/v1/runners/{id}  (requires admin token — not available here)
@@ -736,7 +1031,14 @@ int main(int argc, char* argv[]) {
     if (args.command == "register") {
         ret = cmdRegister(args);
     } else if (args.command == "daemon") {
-        ret = cmdDaemon(args);
+        // If we're the watchdog parent, spawn a child and monitor it.
+        // If we're already the watchdog child (--watchdog-child was passed),
+        // fall through to cmdDaemon which runs the actual daemon loop.
+        if (!args.watchdog_child) {
+            ret = runWatchdog(argc, argv);
+        } else {
+            ret = cmdDaemon(args);
+        }
     } else if (args.command == "run") {
         ret = cmdRun(args);
     } else if (args.command == "unregister") {

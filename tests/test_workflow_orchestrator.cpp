@@ -419,5 +419,51 @@ jobs:
         ASSERT(found_build);
     }));
 
+    // ── cancel() halts a running workflow early ────────────────────────────
+
+    run("cancel() terminates a running long workflow", []() {
+        // This workflow has one job with a step that sleeps for 60 seconds.
+        // We cancel() immediately from a background thread and verify that
+        // orch.run() returns promptly with success=false.
+        const std::string yaml = R"(
+name: sleep-forever
+jobs:
+  sleep:
+    runs-on: haiku
+    steps:
+      - id: long-sleep
+        run: sleep 60
+)";
+        MockRunnerClient mock;
+        auto cfg = makeConfig();
+        WorkflowOrchestrator orch(mock, cfg);
+
+        // Fire cancel() 300 ms after run() starts.
+        std::atomic<bool> cancel_done{false};
+        std::thread cancel_thread([&orch, &cancel_done]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            orch.cancel();
+            cancel_done.store(true);
+        });
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto wf = parseWorkflow(yaml);
+        auto result = orch.run(wf, yaml, "push");
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        cancel_thread.join();
+
+        // The run must have returned well before the 60-second sleep expired.
+        // Allow up to 15 seconds for graceful process termination.
+        ASSERT(elapsed_ms < 15000);
+
+        // Either the orchestrator reported failure (step was killed) or the
+        // cancel happened before any job started (success with empty results).
+        // In either case it must NOT have run for 60 seconds.
+        // (We only assert the timing guarantee; success value is implementation-defined.)
+        ASSERT(cancel_done.load());
+    });
+
     return summary();
 }

@@ -68,6 +68,7 @@ Config loadConfig(const std::string& path) {
     if (root["fetch_interval"]) cfg.fetch_interval = root["fetch_interval"].as<int>();
     if (root["insecure"])     cfg.insecure     = root["insecure"].as<bool>();
     if (root["log_level"])    cfg.log_level    = root["log_level"].as<std::string>();
+    if (root["work_dir"])     cfg.work_dir     = root["work_dir"].as<std::string>();
 
     // Cache server
     if (root["cache"] && root["cache"].IsMap()) {
@@ -112,6 +113,8 @@ void saveConfig(const Config& cfg, const std::string& path) {
     out << YAML::Key << "fetch_interval" << YAML::Value << cfg.fetch_interval;
     out << YAML::Key << "insecure"     << YAML::Value << cfg.insecure;
     out << YAML::Key << "log_level"    << YAML::Value << cfg.log_level;
+    if (!cfg.work_dir.empty())
+        out << YAML::Key << "work_dir" << YAML::Value << cfg.work_dir;
 
     out << YAML::Key << "labels" << YAML::Value << YAML::BeginSeq;
     for (auto& l : cfg.labels) {

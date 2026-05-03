@@ -31,6 +31,10 @@ struct Config {
     int         fetch_timeout  = 30;   ///< FetchTask long-poll timeout, seconds
     int         fetch_interval = 2;    ///< delay between successive FetchTask calls, seconds
     bool        insecure = false;      ///< skip TLS verification (dev/test only!)
+    /// Root directory for job workspaces.  Each job gets a unique subdirectory
+    /// here (e.g. <work_dir>/act_runner_<id>_<random>/).
+    /// Empty = use /tmp (system default).
+    std::string work_dir;
 
     // ── Labels ────────────────────────────────────────────────────────────
     std::vector<LabelDef> labels;      ///< executor labels

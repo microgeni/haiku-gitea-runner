@@ -1,11 +1,36 @@
-// ProcessSpawner.cpp — posix_spawn-based process execution
+// ProcessSpawner.cpp — Process spawning wrapper
+//
+// On Haiku we use load_image() + resume_thread() instead of posix_spawn().
+//
+// WHY: Haiku's posix_spawn() is implemented via an intermediate "spawner
+// thread" that is created inside the parent team.  When that spawner thread
+// exits (after a successful load_image() + resume_thread()), the kernel's
+// thread-exit path can incorrectly deliver SIGKILLTHR (signal 21, the
+// Haiku-private "kill this thread" signal) to the parent team's main thread,
+// killing the entire daemon process.  SIGKILLTHR cannot be caught, blocked,
+// or ignored from user space, so the only correct fix is to avoid
+// posix_spawn() on Haiku altogether.
+//
+// load_image() is a single kernel syscall that creates a new team directly,
+// with the child's main thread starting suspended.  No intermediate thread is
+// created inside the parent team, so SIGKILLTHR cannot fire from this path.
+//
+// Reference: Haiku bug #18708; src/system/libroot/posix/spawn/posix_spawn.cpp
+// in the Haiku source tree.
+
 #include "ProcessSpawner.h"
+
+#ifdef __HAIKU__
+#  include <image.h>   // load_image(), resume_thread()
+#  include <OS.h>      // thread_id, B_OK
+#endif
 
 #include <spawn.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <unistd.h>
 #include <signal.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <cerrno>
 #include <cstring>
@@ -13,6 +38,7 @@
 #include <stdexcept>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 // POSIX: environ is the current process's environment
 extern char** environ;
@@ -69,8 +95,12 @@ void ProcessSpawner::drainOutput(int fd, bool is_stderr, const OutputCallback& c
     char tmp[4096];
 
     while (true) {
-        ssize_t n = read(fd, tmp, sizeof(tmp));
-        if (n <= 0) break;  // EOF or error
+        ssize_t n;
+        do {
+            n = read(fd, tmp, sizeof(tmp));
+        } while (n < 0 && errno == EINTR);  // retry on signal interruption
+
+        if (n <= 0) break;  // EOF or unrecoverable error
 
         buf.append(tmp, n);
 
@@ -104,11 +134,15 @@ ProcessResult ProcessSpawner::run(
     ProcessResult result;
 
     // ── Create pipes ────────────────────────────────────────────────────────
+    // Use O_CLOEXEC so that pipe fds are automatically closed in any
+    // load_image() / exec'd child that doesn't explicitly inherit them.
+    // The write ends are dup2'd to STDOUT/STDERR (which clears O_CLOEXEC on
+    // the dup), giving the child exactly one copy of each write end.
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
 
-    if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
-        throw std::runtime_error(std::string("pipe() failed: ") + strerror(errno));
+    if (pipe2(stdout_pipe, O_CLOEXEC) != 0 || pipe2(stderr_pipe, O_CLOEXEC) != 0) {
+        throw std::runtime_error(std::string("pipe2() failed: ") + strerror(errno));
     }
 
     // ── Build argv ────────────────────────────────────────────────────────
@@ -135,7 +169,10 @@ ProcessResult ProcessSpawner::run(
     for (auto& e : env) envp.push_back(const_cast<char*>(e.c_str()));
     envp.push_back(nullptr);
 
-    // ── Set up posix_spawn file actions ─────────────────────────────────
+    // ── Set up posix_spawn file actions (non-Haiku only) ─────────────────
+    // On Haiku we use load_image() which inherits fds from the parent, so
+    // we redirect our own stdout/stderr directly before calling it.
+#ifndef __HAIKU__
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
 
@@ -152,35 +189,16 @@ ProcessResult ProcessSpawner::run(
     // Stdin from /dev/null
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
                                      "/dev/null", O_RDONLY, 0);
+#endif // !__HAIKU__
 
-    // ── Spawn ────────────────────────────────────────────────────────────
-    // posix_spawn doesn't have a built-in chdir action in POSIX.
-    // Strategy:
-    //   - For file scripts: use posix_spawn_file_actions_addchdir_np if
-    //     available (glibc 2.29+, Haiku), otherwise prepend "cd work_dir &&"
-    //     as a wrapper (only possible for inline scripts, not file scripts).
-    //   - For inline scripts: wrap with "cd work_dir && script"
+    // ── Wrap script with work_dir ─────────────────────────────────────────
     std::string wrapped_script;
-    bool used_chdir_action = false;
-
-#if defined(HAVE_POSIX_SPAWN_CHDIR) || defined(__linux__) || defined(__HAIKU__)
-    // Try to use addchdir_np — if the platform supports it this is the
-    // correct way. We detect support at compile time via the macro.
-    // (Note: actual availability is platform-dependent; we fall through
-    //  to the wrapper approach if it's not available.)
-#endif
 
     if (!work_dir.empty()) {
         if (is_file) {
-            // For file scripts: we must chdir the child to work_dir.
-            // Use the posix_spawn chdir action (POSIX.1-2024 / glibc 2.29+).
-            // If not available, wrap: sh -c "cd <dir> && exec <script_path>"
-#ifdef _POSIX_SPAWN_CHDIR
+#if !defined(__HAIKU__) && defined(_POSIX_SPAWN_CHDIR)
             posix_spawn_file_actions_addchdir_np(&actions, work_dir.c_str());
-            used_chdir_action = true;
 #else
-            // Fallback: switch to -c mode with a cd prefix
-            // Rebuild argv as: [shell, "-c", "cd <dir> && exec <script>"]
             argv.clear();
             argv.push_back(shell_s.data());
             argv.push_back(dash_c.data());
@@ -189,11 +207,7 @@ ProcessResult ProcessSpawner::run(
             argv.push_back(nullptr);
 #endif
         } else {
-            // For inline -c scripts: prepend cd to the script string
             wrapped_script = "cd " + work_dir + " && " + script_s;
-            argv.back() = nullptr;  // was nullptr sentinel
-            argv[argv.size() - 2] = wrapped_script.data();  // replace script arg
-            // But argv layout was [shell, -c, script, nullptr] — fix properly:
             argv.clear();
             argv.push_back(shell_s.data());
             argv.push_back(dash_c.data());
@@ -201,34 +215,101 @@ ProcessResult ProcessSpawner::run(
             argv.push_back(nullptr);
         }
     }
-    (void)used_chdir_action;
 
+#ifndef __HAIKU__
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-
-#ifdef POSIX_SPAWN_SETPGROUP
-    // Put the child in its own process group so we can signal
-    // the entire process group (child + any grandchildren) on timeout/cancel.
+#  ifdef POSIX_SPAWN_SETPGROUP
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-    posix_spawnattr_setpgroup(&attr, 0); // pgroup = child's own PID
-#endif
+    posix_spawnattr_setpgroup(&attr, 0);
+#  endif
+#endif // !__HAIKU__
 
     pid_t pid = -1;
+
+#ifdef __HAIKU__
+    // ── Haiku: use load_image() instead of posix_spawn() ──────────────────
+    //
+    // load_image() creates the child team directly without an intermediate
+    // spawner thread in the parent — avoids the SIGKILLTHR race in
+    // posix_spawn().  The child's main thread starts SUSPENDED; we redirect
+    // its inherited fds then call resume_thread().
+    //
+    // Fd manipulation must be serialised: we temporarily dup2 our own
+    // stdout/stderr to the pipe write ends so load_image() snapshots the
+    // right fds, then restore them immediately after.
+    {
+        static std::mutex s_load_image_mutex;
+        std::lock_guard<std::mutex> lk(s_load_image_mutex);
+
+        // Save parent's stdout/stderr
+        int saved_out = ::dup(STDOUT_FILENO);
+        int saved_err = ::dup(STDERR_FILENO);
+        ::fcntl(saved_out, F_SETFD, FD_CLOEXEC);
+        ::fcntl(saved_err, F_SETFD, FD_CLOEXEC);
+
+        // Redirect to pipe write ends
+        ::dup2(stdout_pipe[1], STDOUT_FILENO);
+        ::dup2(stderr_pipe[1], STDERR_FILENO);
+
+        // Arrange for stdin from /dev/null
+        int dev_null = ::open("/dev/null", O_RDONLY);
+        int saved_in = -1;
+        if (dev_null >= 0) {
+            saved_in = ::dup(STDIN_FILENO);
+            ::fcntl(saved_in, F_SETFD, FD_CLOEXEC);
+            ::dup2(dev_null, STDIN_FILENO);
+            ::close(dev_null);
+        }
+
+        // load_image() — single kernel syscall, no spawner thread created
+        thread_id child_tid = ::load_image(
+            static_cast<int>(argv.size() - 1),
+            const_cast<const char**>(argv.data()),
+            const_cast<const char**>(envp.data())
+        );
+
+        // Restore parent fds immediately
+        ::dup2(saved_out, STDOUT_FILENO);
+        ::dup2(saved_err, STDERR_FILENO);
+        if (saved_in >= 0) { ::dup2(saved_in, STDIN_FILENO); ::close(saved_in); }
+        ::close(saved_out);
+        ::close(saved_err);
+
+        if (child_tid < B_OK) {
+            ::close(stdout_pipe[0]); ::close(stdout_pipe[1]);
+            ::close(stderr_pipe[0]); ::close(stderr_pipe[1]);
+            throw std::runtime_error(
+                std::string("load_image() failed: ") + strerror((int)-child_tid));
+        }
+
+        // Set the child's process group (mirrors POSIX_SPAWN_SETPGROUP)
+        // setpgid() on the child team works before resume_thread()
+        ::setpgid(static_cast<pid_t>(child_tid), 0);
+
+        // Resume the child's main thread
+        ::resume_thread(child_tid);
+
+        pid = static_cast<pid_t>(child_tid);
+    }
+
+#else
+    // ── POSIX fallback: posix_spawn() ─────────────────────────────────────
     int spawn_err = posix_spawn(&pid, shell.c_str(), &actions, &attr,
                                 argv.data(), envp.data());
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
-
-    // Close write ends in parent
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
-
     if (spawn_err != 0) {
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
+        ::close(stdout_pipe[0]); ::close(stdout_pipe[1]);
+        ::close(stderr_pipe[0]); ::close(stderr_pipe[1]);
         throw std::runtime_error(
             std::string("posix_spawn() failed: ") + strerror(spawn_err));
     }
+#endif
+
+    // Close write ends in parent (child has them via inheritance / dup2)
+    ::close(stdout_pipe[1]); stdout_pipe[1] = -1;
+    ::close(stderr_pipe[1]); stderr_pipe[1] = -1;
 
     child_pid_.store(pid);
 

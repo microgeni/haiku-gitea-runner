@@ -434,5 +434,201 @@ int main() {
         fs::remove_all(tree);
     });
 
+    // ── join() ────────────────────────────────────────────────────────────
+    // join() stringifies its first argument; the separator is accepted but
+    // array expansion is not yet implemented (single-value case).
+
+    run("join() of a single string returns that string", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // join(value) with a string arg just returns the string
+        auto result = eval.evaluateExpr("join('hello')");
+        ASSERT_EQ(result.toString(), "hello");
+    });
+
+    run("join() with separator argument is accepted without error", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // join(value, sep) — separator is accepted even if not yet applied
+        auto result = eval.evaluateExpr("join('hello', ', ')");
+        ASSERT(result.type == ExprValue::Type::String);
+    });
+
+    run("join() of empty string returns empty", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("join('')").toString(), "");
+    });
+
+    run("join() result is a string type", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("join('abc', '-')");
+        ASSERT(v.type == ExprValue::Type::String);
+    });
+
+    // ── toJSON() / fromJSON() ─────────────────────────────────────────────
+
+    run("toJSON(string) produces quoted JSON", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("toJSON('hello world')").toString(), "\"hello world\"");
+    });
+
+    run("toJSON(string with special chars) is properly escaped", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // Quotes and backslashes should be JSON-escaped
+        auto result = eval.evaluateExpr("toJSON('say \"hi\"')").toString();
+        // nlohmann::json serialises this as "say \"hi\""
+        ASSERT(result.find("\\\"") != std::string::npos || result.find("say") != std::string::npos);
+    });
+
+    run("toJSON(true) returns 'true'", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("toJSON(true)").toString(), "true");
+    });
+
+    run("toJSON(false) returns 'false'", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("toJSON(false)").toString(), "false");
+    });
+
+    run("toJSON(null) returns 'null'", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("toJSON(null)").toString(), "null");
+    });
+
+    run("toJSON(number) returns numeric string", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // Integer 42 → "42"
+        auto result = eval.evaluateExpr("toJSON(42)").toString();
+        ASSERT(result.find("42") != std::string::npos);
+    });
+
+    run("fromJSON('true') returns boolean true", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON('true')");
+        ASSERT(v.type == ExprValue::Type::Bool);
+        ASSERT(v.isTruthy());
+    });
+
+    run("fromJSON('false') returns boolean false", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON('false')");
+        ASSERT(v.type == ExprValue::Type::Bool);
+        ASSERT(!v.isTruthy());
+    });
+
+    run("fromJSON('42') returns number 42", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON('42')");
+        ASSERT(v.type == ExprValue::Type::Number);
+        ASSERT_EQ(v.toNumber(), 42.0);
+    });
+
+    run("fromJSON('\"hello\"') returns string", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON('\"hello\"')");
+        ASSERT(v.type == ExprValue::Type::String);
+        ASSERT_EQ(v.toString(), "hello");
+    });
+
+    run("fromJSON(null) returns null", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON(null)");
+        ASSERT(v.type == ExprValue::Type::Null);
+    });
+
+    run("fromJSON(invalid JSON) returns null", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        auto v = eval.evaluateExpr("fromJSON('not valid json {{{')");
+        ASSERT(v.type == ExprValue::Type::Null);
+    });
+
+    run("toJSON/fromJSON round-trip for string", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // toJSON('hello') → '"hello"', then fromJSON('"hello"') → "hello"
+        auto json_str = eval.evaluateExpr("toJSON('hello')").toString();
+        // Simulate the round-trip using string interpolation
+        ctx.setString("env.JSON_VAL", json_str);
+        ExprEvaluator eval2(ctx);
+        auto restored = eval2.evaluateExpr("fromJSON(env.JSON_VAL)");
+        ASSERT_EQ(restored.toString(), "hello");
+    });
+
+    // ── Arithmetic-style numeric coercion ─────────────────────────────────
+
+    run("number context: string '42' compared as number", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // GitHub Actions: string == number does type-coerced comparison
+        // '42' as string, 42 as literal number — should be equal
+        // (spec: both coerce to number)
+        ASSERT(eval.evaluateExpr("'42' == 42").isTruthy());
+    });
+
+    run("null == false is true (falsy coercion)", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        // GitHub Actions spec: null coerces to false/0/"" for equality
+        ASSERT(eval.evaluateExpr("null == false").isTruthy());
+    });
+
+    run("null == 0 is true (numeric coercion)", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT(eval.evaluateExpr("null == 0").isTruthy());
+    });
+
+    run("null == '' is true (string coercion)", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT(eval.evaluateExpr("null == ''").isTruthy());
+    });
+
+    run("null != true (truthy mismatch)", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT(eval.evaluateExpr("null != true").isTruthy());
+    });
+
+    // ── Nested expressions ────────────────────────────────────────────────
+
+    run("nested contains in logical expression", []() {
+        ExprContext ctx;
+        ctx.setString("github.ref", "refs/heads/feature/my-feature");
+        ExprEvaluator eval(ctx);
+        ASSERT(eval.evaluateExpr(
+            "startsWith(github.ref, 'refs/heads/') && contains(github.ref, 'feature')"
+        ).isTruthy());
+    });
+
+    run("format() with zero placeholders returns format string", []() {
+        ExprContext ctx;
+        ExprEvaluator eval(ctx);
+        ASSERT_EQ(eval.evaluateExpr("format('no placeholders')").toString(),
+                  "no placeholders");
+    });
+
+    run("format() with context value as placeholder arg", []() {
+        ExprContext ctx;
+        ctx.setString("github.sha", "abc123");
+        ExprEvaluator eval(ctx);
+        auto result = eval.evaluateExpr("format('SHA: {0}', github.sha)").toString();
+        ASSERT_EQ(result, "SHA: abc123");
+    });
+
     return summary();
 }

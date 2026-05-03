@@ -290,5 +290,163 @@ jobs:
         ASSERT_EQ(wf.jobs.at("build").max_parallel, 3);
     });
 
+    // ── on: trigger parsing ───────────────────────────────────────────────
+
+    run("on: scalar (single event)", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on: push
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT_EQ(wf.triggers.size(), 1u);
+        ASSERT(wf.triggers.count("push"));
+        ASSERT(wf.triggeredBy("push"));
+        ASSERT(!wf.triggeredBy("pull_request"));
+    });
+
+    run("on: sequence (multiple events)", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT_EQ(wf.triggers.size(), 3u);
+        ASSERT(wf.triggeredBy("push"));
+        ASSERT(wf.triggeredBy("pull_request"));
+        ASSERT(wf.triggeredBy("workflow_dispatch"));
+        ASSERT(!wf.triggeredBy("release"));
+    });
+
+    run("on: map with branch filter", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches: [main]
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT_EQ(wf.triggers.size(), 2u);
+        ASSERT(wf.triggeredBy("push"));
+        ASSERT(wf.triggeredBy("pull_request"));
+
+        auto& push_filter = wf.triggers.at("push");
+        ASSERT_EQ(push_filter.branches.size(), 2u);
+        ASSERT_EQ(push_filter.branches[0], "main");
+        ASSERT_EQ(push_filter.branches[1], "develop");
+
+        auto& pr_filter = wf.triggers.at("pull_request");
+        ASSERT_EQ(pr_filter.branches.size(), 1u);
+        ASSERT_EQ(pr_filter.branches[0], "main");
+    });
+
+    run("on: map with branches-ignore and paths", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on:
+  push:
+    branches-ignore: [gh-pages]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+    paths-ignore: ['docs/**']
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        auto& tf = wf.triggers.at("push");
+        ASSERT_EQ(tf.branches_ignore.size(), 1u);
+        ASSERT_EQ(tf.branches_ignore[0], "gh-pages");
+        ASSERT_EQ(tf.paths.size(), 2u);
+        ASSERT_EQ(tf.paths[0], "src/**");
+        ASSERT_EQ(tf.paths_ignore.size(), 1u);
+    });
+
+    run("on: pull_request with types", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        auto& tf = wf.triggers.at("pull_request");
+        ASSERT_EQ(tf.types.size(), 3u);
+        ASSERT_EQ(tf.types[0], "opened");
+        ASSERT_EQ(tf.types[2], "reopened");
+    });
+
+    run("on: release with tags filter", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on:
+  release:
+    tags:
+      - 'v*'
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT(wf.triggeredBy("release"));
+        auto& tf = wf.triggers.at("release");
+        ASSERT_EQ(tf.tags.size(), 1u);
+        ASSERT_EQ(tf.tags[0], "v*");
+    });
+
+    run("on: absent → triggeredBy always returns true", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT(wf.triggers.empty());
+        ASSERT(wf.triggeredBy("push"));
+        ASSERT(wf.triggeredBy("pull_request"));
+        ASSERT(wf.triggeredBy("schedule"));
+    });
+
+    run("on: workflow_call and workflow_dispatch", []() {
+        auto wf = parseWorkflow(R"(
+name: T
+on:
+  workflow_call:
+  workflow_dispatch:
+jobs:
+  j:
+    runs-on: haiku
+    steps:
+      - run: echo hi
+)");
+        ASSERT(wf.triggeredBy("workflow_call"));
+        ASSERT(wf.triggeredBy("workflow_dispatch"));
+        ASSERT(!wf.triggeredBy("push"));
+    });
+
     return summary();
 }

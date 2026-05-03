@@ -164,10 +164,34 @@ double ExprValue::toNumber() const {
 }
 
 bool ExprValue::operator==(const ExprValue& o) const {
-    // GitHub loosely compares: coerce to common type
+    // GitHub Actions loose comparison — coerce to common type.
+    // Spec: https://docs.github.com/en/actions/learn-github-actions/expressions#operators
     if (type == Type::Null && o.type == Type::Null) return true;
-    if (type == Type::Null || o.type == Type::Null) return false;
+
+    // null coerces to the zero-value of the other operand's type:
+    //   null == false  → true   (null coerces to false)
+    //   null == 0      → true   (null coerces to 0)
+    //   null == ''     → true   (null coerces to "")
+    if (type == Type::Null) {
+        switch (o.type) {
+            case Type::Bool:   return false == o.b;          // null → false
+            case Type::Number: return 0.0  == o.n;           // null → 0
+            case Type::String: return o.s.empty();           // null → ""
+            default: return false;
+        }
+    }
+    if (o.type == Type::Null) {
+        switch (type) {
+            case Type::Bool:   return b   == false;          // null → false
+            case Type::Number: return n   == 0.0;            // null → 0
+            case Type::String: return s.empty();             // null → ""
+            default: return false;
+        }
+    }
+
+    // Both non-null: if either is Bool, compare truthiness
     if (type == Type::Bool || o.type == Type::Bool) return isTruthy() == o.isTruthy();
+    // If either is Number, compare numerically
     if (type == Type::Number || o.type == Type::Number) return toNumber() == o.toNumber();
     // Both strings (case-insensitive per GitHub spec)
     std::string ls = s, rs = o.s;

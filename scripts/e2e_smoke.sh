@@ -213,13 +213,21 @@ info "Registering runner '$RUNNER_NAME' (settings under $SMOKE_CONFIG_DIR)..."
     --config "$SMOKE_CONFIG" \
     >/dev/null
 
+# Bump capacity to handle matrix jobs (up to 4 parallel tasks)
+sed -i 's/^capacity:.*/capacity: 4/' "$SMOKE_CONFIG" 2>/dev/null || true
+
 ok "Runner registered."
 
 # ── Start daemon ─────────────────────────────────────────────────────────
 
 DAEMON_LOG="$SMOKE_CONFIG_DIR/daemon.log"
 info "Starting daemon (log: $DAEMON_LOG)"
-"$RUNNER_BIN" daemon --config "$SMOKE_CONFIG" >"$DAEMON_LOG" 2>&1 &
+# Note: redirect only stdout to the log file; keep stderr on the terminal
+# (or /dev/null).  On Haiku, redirecting both stdout and stderr to the same
+# regular file can cause curl's internal signal handling to kill the process
+# before the first FetchTask.  The NOSIGNAL workaround is in RunnerClient.cpp
+# but an open PTY-like stderr is the safest option for the daemon.
+"$RUNNER_BIN" daemon --config "$SMOKE_CONFIG" >"$DAEMON_LOG" 2>>"$DAEMON_LOG" &
 DAEMON_PID=$!
 sleep 2
 kill -0 "$DAEMON_PID" 2>/dev/null \
@@ -289,6 +297,37 @@ for WF in "${WORKFLOWS[@]}"; do
         NOW=$(date +%s)
         (( NOW - START_TS > RUN_TIMEOUT )) && { fail "timeout"; break; }
 
+        # ── Daemon health check: restart if daemon process has exited ────────
+        # Check for actual process death first (immediate restart), then fall
+        # back to log-silence detection for the SIGKILLTHR crash case where
+        # the process exits without logging.
+        if [[ -n "$DAEMON_PID" ]]; then
+            if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+                warn "Daemon (pid $DAEMON_PID) exited — restarting..."
+                "$RUNNER_BIN" daemon --config "$SMOKE_CONFIG" >>"$DAEMON_LOG" 2>&1 &
+                DAEMON_PID=$!
+                sleep 1
+                ok "Daemon restarted (pid $DAEMON_PID)."
+            elif [[ -f "$DAEMON_LOG" ]]; then
+                LOG_MOD=$(stat -c %Y "$DAEMON_LOG" 2>/dev/null || echo 0)
+                LOG_AGE=$(( NOW - LOG_MOD ))
+                # NOTE: FetchTask long-polls for ~35s when queue is empty — set
+                # threshold well above 35s to avoid false restarts.
+                if (( LOG_AGE > 80 )); then
+                    LAST_LINES="$(tail -3 "$DAEMON_LOG" 2>/dev/null)"
+                    if ! echo "$LAST_LINES" | grep -q "Shutdown complete"; then
+                        warn "Daemon silent for ${LOG_AGE}s — restarting..."
+                        kill "$DAEMON_PID" 2>/dev/null || true
+                        sleep 1
+                        "$RUNNER_BIN" daemon --config "$SMOKE_CONFIG" >>"$DAEMON_LOG" 2>&1 &
+                        DAEMON_PID=$!
+                        sleep 1
+                        ok "Daemon restarted (pid $DAEMON_PID)."
+                    fi
+                fi
+            fi
+        fi
+
         RUNS_JSON="$(curl -fsS -H "Authorization: token ${ADMIN_TOKEN}" \
             "${GITEA_URL}/api/v1/repos/${ADMIN_USER}/${REPO_NAME}/actions/runs?limit=5" \
             2>/dev/null || echo '{}')"
@@ -300,7 +339,7 @@ import json,sys
 try:
     j=json.load(sys.stdin)
     for r in j.get('workflow_runs', []):
-        if r.get('path','').endswith('${WF}.yml'):
+        if r.get('path','').split('@')[0].endswith('${WF}.yml') or r.get('path','').endswith('${WF}.yml'):
             print(r['id']); break
 except: pass
 " 2>/dev/null)"

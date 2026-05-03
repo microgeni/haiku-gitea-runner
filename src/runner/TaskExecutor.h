@@ -19,6 +19,7 @@
 #include "../config/Config.h"
 #include "../action/ActionRunner.h"
 #include "LogForwarder.h"
+#include "StepRunner.h"
 
 #include <string>
 #include <vector>
@@ -47,7 +48,13 @@ public:
     bool execute();
 
     /// Request cancellation of the running task.
-    void cancel() { cancelled_.store(true); }
+    /// Also kills the currently-running step's child process.
+    void cancel() {
+        cancelled_.store(true);
+        // Kill any currently-running step's subprocess.
+        StepRunner* sr = active_step_runner_.load();
+        if (sr) sr->cancel();
+    }
 
     int64_t taskId() const { return task_.id; }
 
@@ -64,6 +71,10 @@ private:
     const Config& cfg_;
     std::atomic<bool> cancelled_{false};
 
+    // Pointer to the currently-running StepRunner (set during execute()).
+    // Accessed from cancel() which may be called from another thread.
+    std::atomic<StepRunner*> active_step_runner_{nullptr};
+
     // Evaluated job-level outputs (populated by execute()).
     std::vector<std::pair<std::string,std::string>> job_outputs_;
 
@@ -76,7 +87,8 @@ private:
     void reportEnd(bool success,
                    int64_t started_at_s,
                    int64_t stopped_at_s,
-                   const std::vector<StepStateDto>& steps);
+                   const std::vector<StepStateDto>& steps,
+                   const std::vector<std::pair<std::string,std::string>>& job_outputs = {});
 
     /// Create a unique workspace directory for this task.
     std::string createWorkspace();

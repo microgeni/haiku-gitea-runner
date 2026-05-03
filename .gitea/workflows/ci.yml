@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build & Test haiku-act-runner
+    runs-on:
+      - haiku-x64
+
+    env:
+      PATH: /boot/system/develop/tools/bin:/bin:/boot/system/non-packaged/bin:/boot/home/config/non-packaged/bin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pkgman install -y \
+            curl_devel \
+            yaml_cpp_devel \
+            protobuf_devel \
+            libmicrohttpd_devel \
+            openssl_devel \
+            cmake
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_CXX_EXTENSIONS=OFF
+
+      - name: Build
+        run: cmake --build build -- -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure -j1
+
+      - name: Verify binary
+        run: |
+          test -f build/act_runner && echo "Binary OK"
+          build/act_runner version

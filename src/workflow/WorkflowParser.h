@@ -93,9 +93,37 @@ struct Job {
 
 // ─── Workflow ─────────────────────────────────────────────────────────────
 
+// ─── Trigger ──────────────────────────────────────────────────────────────
+
+/// Filter clauses attached to a workflow trigger event.
+/// Each string list may be empty, meaning "no filter" (match everything).
+/// Patterns may include glob syntax (e.g. "refs/heads/**").
+struct TriggerFilter {
+    std::vector<std::string> branches;        ///< branches: filter
+    std::vector<std::string> branches_ignore; ///< branches-ignore: filter
+    std::vector<std::string> tags;            ///< tags: filter
+    std::vector<std::string> tags_ignore;     ///< tags-ignore: filter
+    std::vector<std::string> paths;           ///< paths: filter
+    std::vector<std::string> paths_ignore;    ///< paths-ignore: filter
+    std::vector<std::string> types;           ///< types: (e.g. for pull_request)
+    std::vector<std::string> inputs;          ///< inputs: (for workflow_call/dispatch)
+
+    bool empty() const {
+        return branches.empty() && branches_ignore.empty()
+            && tags.empty()     && tags_ignore.empty()
+            && paths.empty()    && paths_ignore.empty()
+            && types.empty();
+    }
+};
+
 /// Top-level workflow document.
 struct Workflow {
     std::string name;       ///< workflow display name
+
+    // Trigger events: event name → filter configuration.
+    // E.g. { "push": {branches: ["main"]}, "pull_request": {} }
+    // An empty map means "no on: block was parsed" (treat as push).
+    std::map<std::string, TriggerFilter> triggers;
 
     // Global environment variables (lowest precedence)
     std::map<std::string,std::string> env;
@@ -110,6 +138,13 @@ struct Workflow {
     // Concurrency group string (raw, may contain ${{ }})
     std::string concurrency;
     bool concurrency_cancel_in_progress = false;
+
+    /// Returns true if this workflow is triggered by the given event name.
+    /// If triggers is empty, all events are considered matching.
+    bool triggeredBy(const std::string& event_name) const {
+        if (triggers.empty()) return true;
+        return triggers.count(event_name) > 0;
+    }
 };
 
 // ─── Parser ───────────────────────────────────────────────────────────────

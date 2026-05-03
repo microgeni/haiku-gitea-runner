@@ -29,14 +29,16 @@ struct StepRunResult {
 /// Runs a single step, capturing output and managing protocol files.
 class StepRunner {
 public:
-    /// @param workspace_dir  job workspace root (absolute path)
-    /// @param shell          default shell ("/bin/sh" or from job defaults)
-    /// @param action_cache   action cache for 'uses:' steps
-    /// @param gitea_url      Gitea URL for fetching remote actions
+    /// @param workspace_dir       job workspace root (absolute path)
+    /// @param shell               default shell ("/bin/sh" or from job defaults)
+    /// @param action_cache        action cache for 'uses:' steps
+    /// @param gitea_url           Gitea URL (fallback for fetching actions)
+    /// @param default_actions_url Primary URL for remote actions (e.g. "https://github.com")
     StepRunner(std::string workspace_dir,
                std::string default_shell,
                ActionCache* action_cache = nullptr,
-               std::string gitea_url = "");
+               std::string gitea_url = "",
+               std::string default_actions_url = "https://github.com");
 
     /// Execute one step.
     ///
@@ -64,6 +66,7 @@ private:
     std::string  workspace_dir_;
     std::string  default_shell_;
     std::string  gitea_url_;
+    std::string  default_actions_url_;
     ProcessSpawner spawner_;
     std::unique_ptr<ActionCache>  owned_cache_;  // if no external cache provided
     ActionCache*                  action_cache_;  // may point to owned_cache_

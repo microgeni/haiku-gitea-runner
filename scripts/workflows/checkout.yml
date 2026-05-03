@@ -1,0 +1,22 @@
+name: checkout
+# Exercises actions/checkout — clones the repo into the workspace and runs
+# a step that reads a committed file.  Verifies the action-fetching pipeline
+# from gitea_default_actions_url (github.com) via git clone.
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: [haiku]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: |
+          # The repo contains a .gitea/workflows/checkout.yml we just pushed.
+          test -f .gitea/workflows/checkout.yml || {
+            echo "FAIL: checkout.yml not found in workspace"
+            exit 1
+          }
+          echo "PASS: .gitea/workflows/checkout.yml present"
+          echo "SHA: $(git -C . rev-parse HEAD 2>/dev/null || echo unknown)"

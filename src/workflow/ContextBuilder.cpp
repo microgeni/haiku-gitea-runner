@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include "../util/Logger.h"
 
 namespace runner {
 
@@ -129,10 +130,10 @@ ExprContext ContextBuilder::build() const {
     //   needs.<job_id>.result              = "success"|"failure"|...
     //   needs.<job_id>.outputs.<out_name>  = <value>
     if (task_) {
-        for (auto& nc : task_->needs_context) {
-            ctx.setString("needs." + nc.id + ".result", resultName(nc.result));
+        for (auto& [job_id, nc] : task_->needs_context) {
+            ctx.setString("needs." + job_id + ".result", resultName(nc.result));
             for (auto& [ok, ov] : nc.outputs) {
-                ctx.setString("needs." + nc.id + ".outputs." + ok, ov);
+                ctx.setString("needs." + job_id + ".outputs." + ok, ov);
             }
         }
     }
