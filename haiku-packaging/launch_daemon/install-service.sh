@@ -60,6 +60,8 @@ echo "  Wrapper  → $WRAPPER_DIR/act_runner-launch.sh"
 # session.  The already-loaded descriptor invokes run.sh, so we keep run.sh
 # pointing at the current binary so that `launch_roster restart` picks it up
 # without needing a logout.
+SETTINGS_DIR="$HOME/config/settings/act_runner"
+mkdir -p "$SETTINGS_DIR"
 RUN_SH="$SETTINGS_DIR/run.sh"
 cat > "$RUN_SH" << RUNEOF
 #!/bin/sh
@@ -88,12 +90,7 @@ sed \
     > "$LAUNCH_DIR/x-vnd.act-runner"
 echo "  Service  → $LAUNCH_DIR/x-vnd.act-runner"
 
-# ── 5. Create settings directory ────────────────────────────────────────────
-SETTINGS_DIR="$HOME/config/settings/act_runner"
-mkdir -p "$SETTINGS_DIR"
-echo "  Settings → $SETTINGS_DIR"
-
-# ── 6. Check registration ────────────────────────────────────────────────────
+# ── 5. Check registration ────────────────────────────────────────────────────
 REGISTERED=0
 if [ -f "$SETTINGS_DIR/config.yaml" ]; then
     uuid=$(grep -E '^uuid:' "$SETTINGS_DIR/config.yaml" \
@@ -122,7 +119,7 @@ if [ "$REGISTERED" -eq 0 ]; then
     exit 0
 fi
 
-# ── 7. Start / restart the service ──────────────────────────────────────────
+# ── 6. Start / restart the service ──────────────────────────────────────────
 echo ""
 # If already running, restart so it picks up the updated binary via run.sh.
 # If not running, start it fresh.

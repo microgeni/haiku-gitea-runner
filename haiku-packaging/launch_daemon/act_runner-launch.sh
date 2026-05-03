@@ -29,6 +29,7 @@
 
 CONFIG="$HOME/config/settings/act_runner/config.yaml"
 BINARY="@BIN@"
+LOGFILE="$HOME/config/settings/act_runner/daemon.log"
 
 # ── 1. Config file must exist ──────────────────────────────────────────────
 if [ ! -f "$CONFIG" ]; then
@@ -57,4 +58,5 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 # ── 5. All checks passed — hand off to the daemon ─────────────────────────
-exec "$BINARY" daemon --config "$CONFIG"
+exec "$BINARY" daemon --config "$CONFIG" \
+    >> "$LOGFILE" 2>&1
