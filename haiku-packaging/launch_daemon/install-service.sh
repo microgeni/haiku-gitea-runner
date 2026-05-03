@@ -55,7 +55,23 @@ sed "s|@BIN@|$INSTALLED_BIN|g" "$TEMPLATE_WRAPPER" \
 chmod 755 "$WRAPPER_DIR/act_runner-launch.sh"
 echo "  Wrapper  → $WRAPPER_DIR/act_runner-launch.sh"
 
-# ── 3. Install launch_daemon service descriptor ─────────────────────────────
+# ── 3. Write / update run.sh ────────────────────────────────────────────────
+# launch_daemon caches descriptor contents in memory for the lifetime of the
+# session.  The already-loaded descriptor invokes run.sh, so we keep run.sh
+# pointing at the current binary so that `launch_roster restart` picks it up
+# without needing a logout.
+RUN_SH="$SETTINGS_DIR/run.sh"
+cat > "$RUN_SH" << RUNEOF
+#!/bin/sh
+LOG=$SETTINGS_DIR/daemon.log
+BIN=$INSTALLED_BIN
+CFG=$SETTINGS_DIR/config.yaml
+exec "\$BIN" daemon --config "\$CFG" >>"\$LOG" 2>&1
+RUNEOF
+chmod 755 "$RUN_SH"
+echo "  run.sh   → $RUN_SH"
+
+# ── 4. Install launch_daemon service descriptor ─────────────────────────────
 LAUNCH_DIR="$DATA_DIR/user_launch"
 mkdir -p "$LAUNCH_DIR"
 
@@ -72,12 +88,12 @@ sed \
     > "$LAUNCH_DIR/x-vnd.act-runner"
 echo "  Service  → $LAUNCH_DIR/x-vnd.act-runner"
 
-# ── 4. Create settings directory ────────────────────────────────────────────
+# ── 5. Create settings directory ────────────────────────────────────────────
 SETTINGS_DIR="$HOME/config/settings/act_runner"
 mkdir -p "$SETTINGS_DIR"
 echo "  Settings → $SETTINGS_DIR"
 
-# ── 5. Check registration ────────────────────────────────────────────────────
+# ── 6. Check registration ────────────────────────────────────────────────────
 REGISTERED=0
 if [ -f "$SETTINGS_DIR/config.yaml" ]; then
     uuid=$(grep -E '^uuid:' "$SETTINGS_DIR/config.yaml" \
@@ -106,9 +122,14 @@ if [ "$REGISTERED" -eq 0 ]; then
     exit 0
 fi
 
-# ── 6. Try to start immediately ─────────────────────────────────────────────
+# ── 7. Start / restart the service ──────────────────────────────────────────
 echo ""
-if launch_roster start x-vnd.act-runner 2>/dev/null; then
+# If already running, restart so it picks up the updated binary via run.sh.
+# If not running, start it fresh.
+if launch_roster info x-vnd.act-runner 2>/dev/null | grep -q "running.*yes"; then
+    launch_roster restart x-vnd.act-runner 2>/dev/null
+    echo "  ✓ Service restarted with new binary."
+elif launch_roster start x-vnd.act-runner 2>/dev/null; then
     echo "  ✓ Service started."
 else
     echo "  Service will start at next login (or run manually):"
