@@ -26,10 +26,10 @@ jobs:
         run: |
           pkgman install -y \
             curl_devel \
-            yaml_cpp_devel \
+            yaml_cpp0.8_devel \
             protobuf_devel \
             libmicrohttpd_devel \
-            openssl_devel \
+            openssl3_devel \
             cmake
 
       - name: Configure
