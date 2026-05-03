@@ -238,11 +238,15 @@ static std::string encodeDeclareRequest(
 // DeclareResponse { Runner runner = 1; }
 // (same layout as RegisterResponse — reuse decodeRegisterResponse)
 
-// FetchTaskRequest { int64 tasks_version = 1; }
-// NOTE: no labels field — labels are stored on the registered runner in Gitea.
+// FetchTaskRequest {
+//   int64 tasks_version = 1;  // optimistic-concurrency version token
+// }
+// NOTE: No labels field in FetchTaskRequest (v0.4.1 proto) — labels are
+// stored server-side on the registered runner and are not sent per-request.
 static std::string encodeFetchTaskRequest(int64_t tasks_version)
 {
     std::string out;
+    // field 1: int64 tasks_version
     appendInt64(out, 1, tasks_version);
     return out;
 }
@@ -741,8 +745,8 @@ FetchTaskResult RunnerClient::fetchTask(
     int64_t tasks_version,
     int timeout_s)
 {
-    // FetchTaskRequest only has tasks_version; labels are stored on the
-    // registered runner in Gitea and are not repeated per-request.
+    // FetchTaskRequest only has tasks_version (field 1); labels are stored on
+    // the registered runner in Gitea and are not repeated per-request.
     auto req  = proto::encodeFetchTaskRequest(tasks_version);
     auto resp = doRPC("FetchTask", req, timeout_s);
     if (resp.empty()) return FetchTaskResult{};

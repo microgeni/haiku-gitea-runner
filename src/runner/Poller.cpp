@@ -227,7 +227,17 @@ void Poller::pollLoop() {
             );
         } catch (const std::exception& e) {
             if (shutdown_.load()) break;
-            LOG_WARN("Poller", "FetchTask error: " << e.what());
+            // Gitea 1.21+ returns "unregistered runner" (HTTP 500 / Unauthenticated)
+            // when the runner is already busy executing a task.  This is a server-
+            // side quirk, not a real auth failure.  Downgrade to DEBUG so the log
+            // isn't flooded during normal job execution.
+            std::string what = e.what();
+            bool is_busy_quirk = what.find("unregistered runner") != std::string::npos;
+            if (is_busy_quirk) {
+                LOG_DEBUG("Poller", "FetchTask: server busy (runner executing task)");
+            } else {
+                LOG_WARN("Poller", "FetchTask error: " << what);
+            }
             std::this_thread::sleep_for(std::chrono::seconds(cfg_.fetch_interval));
             continue;
         }
