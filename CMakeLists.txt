@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Override with -DRUNNER_VERSION=x.y.z on the cmake command line (e.g. from
 # the haikuporter recipe).  Falls back to "0.1.0-dev" for local builds.
 if(NOT DEFINED RUNNER_VERSION OR RUNNER_VERSION STREQUAL "")
-    set(RUNNER_VERSION "0.2.0")
+    set(RUNNER_VERSION "0.3.0")
 endif()
 message(STATUS "Runner version: ${RUNNER_VERSION}")
 add_compile_definitions(RUNNER_VERSION="${RUNNER_VERSION}")

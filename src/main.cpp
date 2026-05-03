@@ -99,7 +99,7 @@ static void benign_signal_handler(int sig) {
 // ─── Version ──────────────────────────────────────────────────────────────
 
 #ifndef RUNNER_VERSION
-#  define RUNNER_VERSION "0.2.0"
+#  define RUNNER_VERSION "0.3.0"
 #endif
 
 static const char* VERSION = RUNNER_VERSION;
