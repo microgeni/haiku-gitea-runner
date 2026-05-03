@@ -1,36 +1,7 @@
-# act_runner — Haiku launch_daemon user-service descriptor
+# DEPRECATED — this file is superseded by act_runner.launch.template
 #
-# This file is installed to $dataDir/user_launch/act_runner by the
-# haiku_act_runner package.  Haiku's launch_daemon picks it up automatically
-# and makes the service available via:
+# The canonical launch_daemon service descriptor is now generated from
+# act_runner.launch.template by the recipe INSTALL() function and the
+# install-service.sh helper script.
 #
-#   launch_roster start act_runner      # start now
-#   launch_roster stop  act_runner      # stop
-#   launch_roster list                  # show all services + status
-#
-# The service is NOT started on_demand by default — set on_demand to false
-# (below) to start it automatically at login.
-#
-# Before starting the runner you must register it:
-#   act_runner register --url https://your-gitea.example.com \
-#                       --token <registration-token> \
-#                       --name my-haiku-runner \
-#                       --labels haiku:host
-#
-# Then copy config.yaml.example to:
-#   ~/config/settings/act_runner/config.yaml
-# and fill in gitea_url + runner_token.
-#
-# @BIN@ is replaced with the real binary path by the recipe INSTALL().
-
-service act_runner {
-    launch @BIN@ daemon \
-        --config /boot/home/config/settings/act_runner/config.yaml
-
-    # on_demand false = start automatically at login.
-    # on_demand true  = only when explicitly started via launch_roster.
-    on_demand true
-
-    # Do not attempt to start in Haiku's safe mode.
-    no_safemode
-}
+# See act_runner.launch.template for the current descriptor.

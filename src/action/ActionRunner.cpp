@@ -83,7 +83,8 @@ bool ActionCache::downloadViaZip(const std::string& url,
 fs::path ActionCache::fetchAction(const std::string& owner,
                                    const std::string& repo,
                                    const std::string& ref,
-                                   const std::string& gitea_url)
+                                   const std::string& gitea_url,
+                                   const std::string& default_actions_url)
 {
     fs::path dest = cache_root_ / owner / repo / ref;
 
@@ -93,31 +94,56 @@ fs::path ActionCache::fetchAction(const std::string& owner,
 
     LOG_INFO("ActionCache", "Fetching action " << owner << "/" << repo << "@" << ref);
 
-    // Try git clone from Gitea
-    std::string git_url = gitea_url + "/" + owner + "/" + repo;
-    // Append @ref as a branch/tag
-    std::string clone_url = git_url;
-
-    // Try with --branch for the ref
     fs::create_directories(dest.parent_path());
-    std::string cmd = "git clone --depth 1 --branch '" + ref + "' '"
-                    + clone_url + "' '" + dest.string() + "' >/dev/null 2>&1";
-    if (system(cmd.c_str()) == 0) {
-        LOG_INFO("ActionCache", "Cloned " << owner << "/" << repo << "@" << ref);
-        return dest;
-    }
 
-    // Fallback: try zip download from Gitea archive endpoint
-    std::string zip_url = gitea_url + "/" + owner + "/" + repo
-                        + "/archive/" + ref + ".zip";
-    if (downloadViaZip(zip_url, dest)) {
-        LOG_INFO("ActionCache", "Downloaded (zip) " << owner << "/" << repo << "@" << ref);
-        return dest;
+    // Build the list of base URLs to try, in priority order:
+    //   1. default_actions_url  (e.g. "https://github.com" from gitea context)
+    //   2. gitea_url             (mirror on the Gitea instance itself)
+    std::vector<std::string> base_urls;
+    if (!default_actions_url.empty()) base_urls.push_back(default_actions_url);
+    if (!gitea_url.empty() && gitea_url != default_actions_url)
+        base_urls.push_back(gitea_url);
+    if (base_urls.empty()) base_urls.push_back("https://github.com");
+
+    for (const auto& base : base_urls) {
+        std::string clone_url = base + "/" + owner + "/" + repo;
+
+        // Try git clone with --branch for the ref
+        std::string cmd = "git clone --depth 1 --branch '" + ref + "' '"
+                        + clone_url + "' '" + dest.string() + "' 2>&1";
+        if (system(cmd.c_str()) == 0) {
+            LOG_INFO("ActionCache", "Cloned " << owner << "/" << repo
+                     << "@" << ref << " from " << base);
+            return dest;
+        }
+
+        // Remove partial clone dir before trying next URL
+        try { fs::remove_all(dest); } catch (...) {}
+
+        // Fallback: zip archive download
+        std::string zip_url = base + "/" + owner + "/" + repo
+                            + "/archive/refs/tags/" + ref + ".zip";
+        if (downloadViaZip(zip_url, dest)) {
+            LOG_INFO("ActionCache", "Downloaded (zip) " << owner << "/" << repo
+                     << "@" << ref << " from " << base);
+            return dest;
+        }
+        try { fs::remove_all(dest); } catch (...) {}
+
+        // Also try without refs/tags/ path (older Gitea)
+        zip_url = base + "/" + owner + "/" + repo + "/archive/" + ref + ".zip";
+        if (downloadViaZip(zip_url, dest)) {
+            LOG_INFO("ActionCache", "Downloaded (zip) " << owner << "/" << repo
+                     << "@" << ref << " from " << base);
+            return dest;
+        }
+        try { fs::remove_all(dest); } catch (...) {}
     }
 
     throw std::runtime_error(
         "Failed to fetch action " + owner + "/" + repo + "@" + ref
-        + " — check that the action exists on " + gitea_url);
+        + " — check that the action exists on "
+        + (base_urls.empty() ? "github.com" : base_urls[0]));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -225,11 +251,15 @@ ActionDefinition ActionRunner::parseActionYaml(const fs::path& path) {
 ActionRunner::ActionRunner(fs::path workspace_dir,
                              ActionCache& cache,
                              std::string default_shell,
-                             std::string gitea_url)
+                             std::string gitea_url,
+                             std::string default_actions_url)
     : workspace_dir_(std::move(workspace_dir))
     , cache_(cache)
     , default_shell_(std::move(default_shell))
     , gitea_url_(std::move(gitea_url))
+    , default_actions_url_(default_actions_url.empty()
+                           ? "https://github.com"
+                           : std::move(default_actions_url))
 {}
 
 // ─── parseActionRef ───────────────────────────────────────────────────────
@@ -292,7 +322,8 @@ fs::path ActionRunner::resolveActionDir(const std::string& uses,
         throw std::runtime_error("Invalid action reference: " + uses);
     }
 
-    fs::path action_dir = cache_.fetchAction(owner, repo, ref, gitea_url_);
+    fs::path action_dir = cache_.fetchAction(owner, repo, ref, gitea_url_,
+                                              default_actions_url_);
     if (!subdir.empty()) action_dir /= subdir;
 
     if (!fs::exists(action_dir / "action.yml") &&
@@ -451,7 +482,30 @@ ActionRunResult ActionRunner::run(
 
         bool clone_ok = false;
         {
-            ProcessResult clone_result = spawner.run("/bin/sh", git_cmd,
+            // If the destination already exists and is non-empty (the usual
+            // case for the workspace root), use git init + fetch + checkout
+            // rather than git clone, which can't clone into a non-empty dir.
+            bool dest_exists = fs::exists(dest) &&
+                               !fs::is_empty(dest);
+
+            std::string run_script;
+            if (dest_exists) {
+                // In-place checkout into existing directory
+                run_script =
+                    "cd " + dest.string() + " && "
+                    "git init -q && "
+                    "git remote add origin " + clone_url + " 2>/dev/null || "
+                    "git remote set-url origin " + clone_url + " && "
+                    "git fetch --quiet"
+                    + (fetch_depth > 0 ? " --depth=" + std::to_string(fetch_depth) : "")
+                    + " origin "
+                    + (clone_ref.empty() ? "" : clone_ref)
+                    + " && git checkout -q FETCH_HEAD";
+            } else {
+                run_script = git_cmd;
+            }
+
+            ProcessResult clone_result = spawner.run("/bin/sh", run_script,
                 dest.string(), git_envp,
                 [&log](const std::string& line, bool is_err) {
                     if (is_err) log.append("##[debug]" + line);

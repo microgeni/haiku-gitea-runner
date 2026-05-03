@@ -52,8 +52,9 @@ TaskExecutor::TaskExecutor(IRunnerClient& client,
 // ─── createWorkspace ──────────────────────────────────────────────────────
 
 std::string TaskExecutor::createWorkspace() {
-    // Use /tmp/act_runner_<task_id>_<random> for isolation
-    std::string path = "/tmp/act_runner_"
+    // Base directory: use configured work_dir, falling back to /tmp.
+    std::string base = cfg_.work_dir.empty() ? "/tmp" : cfg_.work_dir;
+    std::string path = base + "/act_runner_"
                      + std::to_string(task_.id)
                      + "_" + randomHex(4);
     fs::create_directories(path);
@@ -80,13 +81,25 @@ TaskExecutor::buildBaseEnv(const std::string& workspace) const
     env.emplace_back("GITHUB_ACTION_PATH",        workspace);
     env.emplace_back("RUNNER_WORKSPACE",          workspace);
 
-    // Runtime token for toolkit callbacks
-    if (!task_.gitea_runtime_token.empty()) {
-        env.emplace_back("ACTIONS_RUNTIME_TOKEN",  task_.gitea_runtime_token);
+    // Runtime token for toolkit callbacks — extract from context if present.
+    std::string gitea_runtime_token;
+    for (auto& [k, v] : task_.context) {
+        if (k == "gitea_runtime_token" || k == "token") {
+            gitea_runtime_token = v;
+            break;
+        }
+    }
+    // Also check the dedicated field (kept for local/test use)
+    if (gitea_runtime_token.empty() && !task_.gitea_runtime_token.empty()) {
+        gitea_runtime_token = task_.gitea_runtime_token;
+    }
+
+    if (!gitea_runtime_token.empty()) {
+        env.emplace_back("ACTIONS_RUNTIME_TOKEN",  gitea_runtime_token);
         env.emplace_back("ACTIONS_RUNTIME_URL",    cfg_.gitea_url + "/_git/");
         // GITHUB_TOKEN is the standard name used by actions/checkout, gh CLI,
         // and virtually every published action that calls the Gitea API.
-        env.emplace_back("GITHUB_TOKEN",            task_.gitea_runtime_token);
+        env.emplace_back("GITHUB_TOKEN",           gitea_runtime_token);
     }
 
     // Task context values — map flat Gitea context keys to GITHUB_* env vars.
@@ -214,13 +227,21 @@ void TaskExecutor::reportStart(int64_t started_at_s) {
 void TaskExecutor::reportEnd(bool success,
                               int64_t started_at_s,
                               int64_t stopped_at_s,
-                              const std::vector<StepStateDto>& steps)
+                              const std::vector<StepStateDto>& steps,
+                              const std::vector<std::pair<std::string,std::string>>& job_outputs)
 {
     int result = success ? 1 /*RESULT_SUCCESS*/ : 2 /*RESULT_FAILURE*/;
     if (cancelled_.load()) result = 3; /*RESULT_CANCELLED*/
 
+    static const char* resultNames[] = {"unspecified","success","failure","cancelled"};
+    LOG_INFO("TaskExecutor", "UpdateTask id=" << task_.id
+             << " result=" << resultNames[std::min(result, 3)]
+             << " outputs=" << job_outputs.size());
     try {
-        client_.updateTask(task_.id, result, steps, started_at_s, stopped_at_s);
+        auto r = client_.updateTask(task_.id, result, steps, started_at_s, stopped_at_s,
+                                    job_outputs);
+        LOG_INFO("TaskExecutor", "UpdateTask ack: task_id=" << r.task_id
+                 << " state=" << r.state);
     } catch (const std::exception& e) {
         LOG_WARN("TaskExecutor", "reportEnd failed: " << e.what());
     }
@@ -273,27 +294,40 @@ bool TaskExecutor::execute() {
     EnvManager env_mgr(workspace + "/_runner");
     env_mgr.setup(event_payload, event_name);
 
-    // Log forwarder — stderr (via Logger) + batched UpdateLog
+    // ── Collect secrets BEFORE constructing LogForwarder ──────────────────
+    // The LogForwarder worker thread starts in the constructor.  If secrets
+    // were registered afterwards (via addSecret) there would be a window where
+    // the first log lines from reportStart/buildBaseEnv could be emitted
+    // without masking applied.  Collect them all here so they are pre-loaded
+    // into the forwarder before the worker thread is spawned.
+    std::vector<std::string> initial_secrets;
+    for (auto& [k, v] : task_.secrets) {
+        if (!v.empty()) initial_secrets.push_back(v);
+    }
+    if (!task_.gitea_runtime_token.empty()) {
+        initial_secrets.push_back(task_.gitea_runtime_token);
+    }
+    for (auto& [k, v] : task_.context) {
+        if ((k == "gitea_runtime_token" || k == "token") && !v.empty()) {
+            // Avoid duplicates
+            bool found = false;
+            for (auto& s : initial_secrets) if (s == v) { found = true; break; }
+            if (!found) initial_secrets.push_back(v);
+        }
+    }
+
+    // Log forwarder — starts with secrets pre-loaded so no masking window.
     auto console_cb = [](const LogLine& ll) {
         LOG_INFO("Job", ll.content);
     };
-    LogForwarder log_fwd(client_, task_.id, 50, 1000, console_cb);
+    LogForwarder log_fwd(client_, task_.id, 50, 1000, console_cb,
+                         std::move(initial_secrets));
 
     // Report start
     reportStart(started_at);
 
     // ── Build base environment ─────────────────────────────────────────
     auto base_env = buildBaseEnv(workspace);
-
-    // ── Register secrets for log masking ─────────────────────────────
-    // All secret values and the runtime token must be masked in log output
-    // to prevent accidental credential exposure in the job log.
-    for (auto& [k, v] : task_.secrets) {
-        log_fwd.addSecret(v);
-    }
-    if (!task_.gitea_runtime_token.empty()) {
-        log_fwd.addSecret(task_.gitea_runtime_token);
-    }
 
     // ── Build initial context ─────────────────────────────────────────
     std::map<std::string,std::string> job_env_map;
@@ -303,12 +337,27 @@ bool TaskExecutor::execute() {
     ctx_builder
         .withTask(task_)
         .withRunnerInfo(cfg_.name)
+        .withWorkDir(cfg_.work_dir)
         .withJobEnv(job_env_map);
 
-    // ── Extract matrix combination (if any) from task.context ─────────
-    // The Gitea server pre-expands matrix jobs and dispatches one task per
-    // combination; the values for this combination arrive via task.context.
+    // ── Extract matrix combination (if any) ──────────────────────────
+    // Gitea pre-expands each matrix combination into a separate task.
+    // The combination values are in the expanded workflow YAML under
+    // strategy.matrix (single-element lists).  Fallback: check task.context
+    // for legacy "matrix" or "matrix.*" keys.
     auto matrix_combo = extractMatrixCombo(task_.context);
+    if (matrix_combo.empty() && job->matrix.has_value()) {
+        for (auto& [k, vals] : job->matrix->axes) {
+            if (!vals.empty()) matrix_combo[k] = vals[0];
+        }
+        // Include entries (e.g. extra keys added via include:)
+        for (auto& inc : job->matrix->include) {
+            for (auto& [k, v] : inc) {
+                if (matrix_combo.find(k) == matrix_combo.end())
+                    matrix_combo[k] = v;
+            }
+        }
+    }
     if (!matrix_combo.empty()) {
         ctx_builder.withMatrix(matrix_combo);
         for (auto& [k, v] : matrix_combo) {
@@ -353,8 +402,32 @@ bool TaskExecutor::execute() {
     else if (!wf.default_shell.empty()) default_shell = wf.default_shell;
     if (default_shell == "bash") default_shell = "/bin/bash";
 
+    // ── Determine action fetch URLs from task context ──────────────────
+    // gitea_default_actions_url: the server to clone published actions from.
+    // Gitea sets this to "https://github.com" by default, but admins can
+    // configure a mirror (e.g. a local Gitea instance with mirrored actions).
+    std::string default_actions_url = "https://github.com";
+    for (auto& [k, v] : task_.context) {
+        if (k == "gitea_default_actions_url" && !v.empty()) {
+            default_actions_url = v;
+            break;
+        }
+    }
+
     // ── Step runner ────────────────────────────────────────────────────
-    StepRunner step_runner(workspace, default_shell);
+    // actions_cache_dir: shared across all jobs on this runner so that
+    // downloaded actions (e.g. actions/checkout) are cached between runs.
+    std::string actions_cache_dir = cfg_.work_dir.empty()
+                                  ? "/tmp/act_runner_actions"
+                                  : cfg_.work_dir + "/act_runner_actions";
+    StepRunner step_runner(workspace, default_shell,
+                           /*action_cache=*/nullptr,
+                           cfg_.gitea_url,
+                           default_actions_url,
+                           actions_cache_dir);
+
+    // Register this step_runner so cancel() can interrupt a running step.
+    active_step_runner_.store(&step_runner);
 
     // Deferred post: scripts — filled by StepRunner/ActionRunner when a JS
     // action has a post: hook.  Drained in reverse order after all steps.
@@ -416,7 +489,7 @@ bool TaskExecutor::execute() {
         // longer would delay the updateTask RPC.
         // Use currentLogIndex() (atomic) for the best available count.
         StepStateDto ss;
-        ss.id         = static_cast<int64_t>(i + 1); // 1-based
+        ss.id         = static_cast<int64_t>(i);  // 0-based, matches act_runner convention
         ss.result     = step_result.success ? 1 /*SUCCESS*/ : 2 /*FAILURE*/;
         ss.started_at_s = step_start;
         ss.stopped_at_s = step_end;
@@ -512,7 +585,10 @@ bool TaskExecutor::execute() {
     int64_t stopped_at = now_s();
     cleanupWorkspace(workspace);
 
-    reportEnd(overall_success, started_at, stopped_at, step_states);
+    // Clear the step runner reference before it goes out of scope.
+    active_step_runner_.store(nullptr);
+
+    reportEnd(overall_success, started_at, stopped_at, step_states, job_outputs_);
 
     LOG_INFO("TaskExecutor", "Task " << task_.id << " completed: "
              << (overall_success ? "SUCCESS" : "FAILURE"));

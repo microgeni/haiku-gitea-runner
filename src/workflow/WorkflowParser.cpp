@@ -144,6 +144,26 @@ static Job parseJob(const std::string& id, const YAML::Node& n) {
     return j;
 }
 
+// ─── parseTrigger ─────────────────────────────────────────────────────────
+
+/// Parse a single event-filter node (e.g. the value under "push:" key).
+/// The node may be null/scalar (no filters) or a mapping with branches:/tags:/etc.
+static TriggerFilter parseTriggerFilter(const YAML::Node& n) {
+    TriggerFilter tf;
+    if (!n || n.IsNull() || n.IsScalar()) return tf; // no filters
+    if (!n.IsMap()) return tf;
+
+    if (n["branches"])        tf.branches        = parseStringSeq(n["branches"]);
+    if (n["branches-ignore"]) tf.branches_ignore = parseStringSeq(n["branches-ignore"]);
+    if (n["tags"])            tf.tags            = parseStringSeq(n["tags"]);
+    if (n["tags-ignore"])     tf.tags_ignore     = parseStringSeq(n["tags-ignore"]);
+    if (n["paths"])           tf.paths           = parseStringSeq(n["paths"]);
+    if (n["paths-ignore"])    tf.paths_ignore    = parseStringSeq(n["paths-ignore"]);
+    if (n["types"])           tf.types           = parseStringSeq(n["types"]);
+
+    return tf;
+}
+
 // ─── parseWorkflow ────────────────────────────────────────────────────────
 
 Workflow parseWorkflow(const std::string& yaml_content) {
@@ -157,6 +177,34 @@ Workflow parseWorkflow(const std::string& yaml_content) {
     Workflow wf;
     wf.name = str(root["name"]);
     wf.env  = parseStringMap(root["env"]);
+
+    // ── Parse 'on:' trigger block ───────────────────────────────────────
+    // The 'on:' key can be:
+    //   on: push                             → scalar event name
+    //   on: [push, pull_request]             → sequence of event names
+    //   on:                                  → mapping of event→filter
+    //     push:
+    //       branches: [main]
+    //     pull_request:
+    //       types: [opened, synchronize]
+    if (root["on"]) {
+        const auto& on_node = root["on"];
+        if (on_node.IsScalar()) {
+            // Single event name
+            wf.triggers[on_node.as<std::string>()] = TriggerFilter{};
+        } else if (on_node.IsSequence()) {
+            // List of event names, no filters
+            for (const auto& ev : on_node) {
+                wf.triggers[ev.as<std::string>()] = TriggerFilter{};
+            }
+        } else if (on_node.IsMap()) {
+            // Map of event → filter config
+            for (const auto& kv : on_node) {
+                std::string event_name = kv.first.as<std::string>();
+                wf.triggers[event_name] = parseTriggerFilter(kv.second);
+            }
+        }
+    }
 
     if (root["defaults"] && root["defaults"]["run"]) {
         wf.default_shell       = str(root["defaults"]["run"]["shell"]);

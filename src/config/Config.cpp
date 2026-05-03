@@ -62,12 +62,14 @@ Config loadConfig(const std::string& path) {
 
     // Optional fields
     if (root["runner_token"]) cfg.runner_token = root["runner_token"].as<std::string>();
+    if (root["uuid"])         cfg.uuid         = root["uuid"].as<std::string>();
     if (root["name"])         cfg.name         = root["name"].as<std::string>();
     if (root["capacity"])     cfg.capacity     = root["capacity"].as<int>();
     if (root["fetch_timeout"])  cfg.fetch_timeout  = root["fetch_timeout"].as<int>();
     if (root["fetch_interval"]) cfg.fetch_interval = root["fetch_interval"].as<int>();
     if (root["insecure"])     cfg.insecure     = root["insecure"].as<bool>();
     if (root["log_level"])    cfg.log_level    = root["log_level"].as<std::string>();
+    if (root["work_dir"])     cfg.work_dir     = root["work_dir"].as<std::string>();
 
     // Cache server
     if (root["cache"] && root["cache"].IsMap()) {
@@ -106,12 +108,15 @@ void saveConfig(const Config& cfg, const std::string& path) {
     out << YAML::BeginMap;
     out << YAML::Key << "gitea_url"    << YAML::Value << cfg.gitea_url;
     out << YAML::Key << "runner_token" << YAML::Value << cfg.runner_token;
+    out << YAML::Key << "uuid"         << YAML::Value << cfg.uuid;
     out << YAML::Key << "name"         << YAML::Value << cfg.name;
     out << YAML::Key << "capacity"     << YAML::Value << cfg.capacity;
     out << YAML::Key << "fetch_timeout"  << YAML::Value << cfg.fetch_timeout;
     out << YAML::Key << "fetch_interval" << YAML::Value << cfg.fetch_interval;
     out << YAML::Key << "insecure"     << YAML::Value << cfg.insecure;
     out << YAML::Key << "log_level"    << YAML::Value << cfg.log_level;
+    if (!cfg.work_dir.empty())
+        out << YAML::Key << "work_dir" << YAML::Value << cfg.work_dir;
 
     out << YAML::Key << "labels" << YAML::Value << YAML::BeginSeq;
     for (auto& l : cfg.labels) {

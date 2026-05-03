@@ -1,206 +1,531 @@
 # haiku-act-runner
 
-A native C++ port of the [Gitea Actions Runner](https://gitea.com/gitea/act_runner) for **Haiku OS**.
+A native C++20 port of the [Gitea Actions Runner](https://gitea.com/gitea/act_runner)
+for **Haiku OS** — no Docker, no Go toolchain, no gRPC runtime required.
 
-## Status
+---
 
-All phases implemented: registration, Connect-RPC polling, workflow parsing, expression evaluation, host-executor step running, composite/JS actions, local `actions/cache` HTTP server, Haiku launch_daemon integration, HPKG packaging recipe, and local workflow execution (`run` subcommand).
+## Features
 
-| Phase | Feature | Status |
-|-------|---------|--------|
-| 1 | Registration (HTTP REST) | ✅ Implemented |
-| 2 | Connect-RPC transport (libcurl fallback) | ✅ Implemented |
-| 2 | Protobuf encode/decode (hand-coded) | ✅ Implemented |
-| 3 | `run:` step execution via `posix_spawn` | ✅ Implemented |
-| 3 | Log streaming (UpdateLog) | ✅ Implemented |
-| 3 | `$GITHUB_OUTPUT` / `$GITHUB_ENV` protocol | ✅ Implemented |
-| 4 | `${{ }}` expression evaluator | ✅ Implemented |
-| 4 | Context objects (github/env/runner/steps/needs/matrix) | ✅ Implemented |
-| 5 | `uses:` composite + JS action support | ✅ Implemented |
-| 5 | Matrix expansion (server-side pre-expansion honoured) | ✅ Implemented |
-| 5 | Local `actions/cache` HTTP server | ✅ Implemented |
-| 6 | Haiku `launch_daemon` service | ✅ Implemented |
-| 6 | HPKG packaging recipe | ✅ Implemented |
-| 6 | Local `run` subcommand (no Gitea server needed) | ✅ Implemented |
-| 6 | `unregister` subcommand | ✅ Implemented |
+| Feature | Status |
+|---------|--------|
+| Registration via HTTP REST | ✅ |
+| Connect-RPC transport (libcurl + hand-coded protobuf) | ✅ |
+| FetchTask long-poll loop with capacity semaphore | ✅ |
+| `run:` step execution via `load_image()` / `posix_spawn()` | ✅ |
+| Log streaming (`UpdateLog` batched RPC) | ✅ |
+| `$GITHUB_OUTPUT` / `$GITHUB_ENV` / `$GITHUB_PATH` protocol | ✅ |
+| `${{ }}` expression evaluator (full GitHub Actions spec) | ✅ |
+| `github.*`, `env.*`, `runner.*`, `steps.*`, `needs.*` contexts | ✅ |
+| Job matrix expansion (include/exclude) | ✅ |
+| `needs:` dependency graph (topological sort + wave schedule) | ✅ |
+| `uses:` composite and JavaScript actions | ✅ |
+| `actions/checkout` (real git clone) | ✅ |
+| `actions/cache` / artifact APIs (local HTTP server) | ✅ |
+| `if:` conditions on steps and jobs | ✅ |
+| Job-level and step-level timeouts | ✅ |
+| `continue-on-error:` / `fail-fast:` / `max-parallel:` | ✅ |
+| `on:` trigger parsing (push/pull_request/schedule/…) | ✅ |
+| Watchdog process (auto-restart on crash) | ✅ |
+| Haiku `launch_daemon` service descriptor | ✅ |
+| Local `run` subcommand (no Gitea server needed) | ✅ |
+| Graceful shutdown on SIGINT/SIGTERM | ✅ |
+| Secret masking in logs | ✅ |
+| `hashFiles()` with recursive `**` glob (SHA-256) | ✅ |
 
-## Dependencies
+---
 
-Install on Haiku:
+## Requirements
+
+### Build host: Haiku OS (64-bit, R1/β5 or later)
 
 ```bash
-pkgman install curl_devel yaml_cpp_devel protobuf_devel libmicrohttpd_devel
+pkgman install curl_devel yaml_cpp_devel protobuf_devel libmicrohttpd_devel openssl_devel cmake
 ```
 
-The nlohmann/json header is bundled in `vendor/nlohmann/json.hpp`.
+The [`nlohmann/json`](https://github.com/nlohmann/json) header is bundled in
+`vendor/nlohmann/json.hpp`. If you cloned without it, fetch it once:
 
-Download it:
 ```bash
 mkdir -p vendor/nlohmann
 curl -L https://github.com/nlohmann/json/releases/latest/download/json.hpp \
      -o vendor/nlohmann/json.hpp
 ```
 
+### Runtime dependencies (Haiku)
+
+| Package | Purpose |
+|---------|---------|
+| `curl` | HTTP transport for RPC and registration |
+| `openssl` | TLS and SHA-256 (used by `hashFiles()`) |
+| `libmicrohttpd` | Local cache/artifact HTTP server |
+| `git` *(optional)* | `actions/checkout` and remote action fetching |
+| `nodejs20` *(optional)* | JavaScript actions (`actions/cache`, etc.) |
+
+---
+
 ## Build
 
 ```bash
+git clone https://example.com/haiku-act-runner.git
+cd haiku-act-runner
+
+# Bundle nlohmann/json if not already present
+mkdir -p vendor/nlohmann
+curl -sSL https://github.com/nlohmann/json/releases/latest/download/json.hpp \
+     -o vendor/nlohmann/json.hpp
+
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-## Usage
+The resulting binary is `build/act_runner`.
 
-### 1. Register the runner
+### Build options
 
-First, get a registration token from Gitea:
-- Web UI: Repository → Settings → Actions → Runners → "New Runner"
-- Or API: `POST /api/v1/runners/registration-token` with your admin token
+| CMake variable | Default | Description |
+|----------------|---------|-------------|
+| `CMAKE_BUILD_TYPE` | `Release` | `Release` / `Debug` / `RelWithDebInfo` |
+| `RUNNER_VERSION` | `0.2.0` | Version string embedded in `--version` output |
 
-Then register:
+---
+
+## Quick start
+
+### Step 1 — Get a registration token from Gitea
+
+There are three runner scopes. **Global (instance-level) is recommended** — it
+accepts jobs from any repository on the Gitea instance without needing a
+separate registration per repo.
+
+| Scope | Token location | Receives jobs from |
+|-------|---------------|-------------------|
+| **Global** ✅ | Site Administration → Actions → Runners → *Create runner* | All repositories on the instance |
+| Organisation | Organisation Settings → Actions → Runners | Repos in that org only |
+| Repository | Repo Settings → Actions → Runners | That repo only |
+
+> **Note:** Individual (repo/org) runners will not pick up jobs from other
+> repositories. If the runner appears idle despite queued jobs, check that it
+> is registered at the correct scope. Registering as **Global** is the
+> simplest setup and works immediately.
+
+### Step 2 — Register the runner
 
 ```bash
 ./act_runner register \
     --url https://gitea.example.com \
-    --token PASTE_REGISTRATION_TOKEN_HERE \
+    --token PASTE_TOKEN_HERE \
     --name haiku-builder \
-    --labels "haiku:host,haiku-latest:host"
+    --labels "haiku:host,haiku-latest:host,haiku-x64:host"
 ```
 
-### 2. Start the daemon
+The label format is `<label-name>:<executor-type>`. The `:host` suffix tells
+Gitea this is a host-executor runner (no Docker). The part before `:` is what
+workflows use in `runs-on:`.
+
+This writes `/boot/home/config/settings/act_runner/config.yaml` and
+`/boot/home/config/settings/act_runner/.runner`.
+
+To get a global registration token via the API (requires admin API key):
+
+```bash
+curl -s -X POST https://gitea.example.com/api/v1/admin/runners/registration-token \
+     -H "Authorization: token <admin-api-key>"
+```
+
+### Step 3 — Start the daemon
 
 ```bash
 ./act_runner daemon
 ```
 
-Or with a custom config file and debug logging:
+The daemon long-polls Gitea for jobs, executes them (host-executor only — no Docker),
+and streams logs back in real time.  Press `Ctrl-C` or send `SIGTERM` to stop
+gracefully.
 
-```bash
-./act_runner daemon --config /boot/home/config/settings/act_runner/config.yaml \
-                    --log-level debug
+---
+
+## Subcommands
+
+```
+act_runner register   --url <url> --token <token> [--name <name>] [--labels <l,...>]
+                      [--config <path>] [--insecure]
+act_runner daemon     [--config <path>] [--log-level debug|info|warn|error]
+act_runner run        <workflow.yml> [--event <name>] [--payload <json|@file>]
+                      [--job <id>] [--log-level <level>] [--retry <n>]
+act_runner unregister [--config <path>]
+act_runner version
+act_runner help
 ```
 
-### 3. Run a workflow locally (no Gitea server needed)
+### `daemon`
 
-The `run` subcommand executes a workflow file directly on the local machine
-using the same engine as the daemon, but without connecting to any Gitea server.
-Useful for testing workflows before pushing.
+Starts the runner and polls Gitea for jobs indefinitely.  On Haiku, it
+automatically installs a watchdog process that restarts the daemon on crash
+with exponential back-off (max 5 minutes between retries).
+
+### `run` — local workflow execution (no server required)
+
+Runs a workflow YAML file directly on the local machine without connecting to
+any Gitea server.  Useful for testing workflows before pushing.
 
 ```bash
-# Run all jobs in a workflow:
+# Run all jobs:
 ./act_runner run .gitea/workflows/ci.yml
 
-# Simulate a specific event:
-./act_runner run .gitea/workflows/ci.yml --event workflow_dispatch
+# Simulate a different event:
+./act_runner run .gitea/workflows/ci.yml --event pull_request
 
-# Run only one job (and its dependencies):
+# Run only one job and its dependencies:
 ./act_runner run .gitea/workflows/ci.yml --job build
 
-# Pass an event payload from a file:
-./act_runner run .gitea/workflows/ci.yml --event push --payload @event.json
+# Pass a JSON event payload:
+./act_runner run .gitea/workflows/ci.yml --event push --payload '{"ref":"refs/heads/main"}'
 
-# Verbose output:
+# Read payload from a file:
+./act_runner run .gitea/workflows/ci.yml --event push --payload @push_event.json
+
+# Auto-retry on Haiku SIGKILLTHR transients:
+./act_runner run .gitea/workflows/ci.yml --retry 3
+
+# Verbose:
 ./act_runner run .gitea/workflows/ci.yml --log-level debug
 ```
 
-The exit code mirrors the overall workflow result: `0` for success, `1` for failure.
+Exit code: `0` = all jobs succeeded, `1` = one or more jobs failed.
 
-### 4. Unregister the runner
+> **Tip (Haiku):** On Haiku, `posix_spawn()` can occasionally deliver
+> `SIGKILLTHR` (signal 7) to a newly-started child when many threads are
+> running simultaneously.  `--retry 3` re-runs the entire workflow up to 3
+> additional times to recover from these transients.
 
-Remove the local runner state (and optionally notify Gitea):
+### `unregister`
+
+Removes the local runner state (`~/.runner` equivalent) and clears the token
+from `config.yaml`.  Does not require network access.  If the runner still
+appears in Gitea's web UI, delete it there manually.
 
 ```bash
 ./act_runner unregister
+# or with a custom config:
+./act_runner unregister --config /path/to/config.yaml
 ```
 
-This removes the local `.runner` state file and clears the token from the config.
-If the runner still appears in Gitea's web UI, remove it manually:
-`Site Administration → Actions → Runners`.
+---
 
-### 5. End-to-end smoke test (optional)
+## Configuration
 
-The `scripts/` directory contains a self-contained harness that stands up
-a throwaway Gitea in Docker (on any Linux/macOS host), pushes a test
-workflow, drives a real `act_runner daemon`, and asserts that the run
-succeeds.  Sample workflows exercise the `CacheServer`, matrix expansion,
-and `needs.<job>.outputs.*` wiring:
+The config file is created automatically by `register`.  Default location:
 
-```bash
-# On a Docker host:
-./scripts/gitea_up.sh                 # produces scripts/.gitea-env.json
-
-# Copy that JSON over, then on Haiku:
-./scripts/e2e_smoke.sh                # runs hello.yml
-./scripts/e2e_smoke.sh --all          # all four sample workflows
+```
+/boot/home/config/settings/act_runner/config.yaml
 ```
 
-See `scripts/README.md` for the full workflow.
-
-### 3. Write workflows targeting Haiku
+Full reference:
 
 ```yaml
-name: Build on Haiku
-on: [push]
+gitea_url: https://gitea.example.com   # required
+name: taurus                            # display name (default: hostname)
+capacity: 1                             # max concurrent jobs  (1 – 16)
+fetch_timeout: 30                       # FetchTask long-poll timeout, seconds
+fetch_interval: 2                       # delay between FetchTask calls, seconds
+insecure: false                         # skip TLS certificate verification
 
+log_level: info                         # debug | info | warn | error
+
+labels:
+  - haiku:host                          # custom label — "host" executor on Haiku
+  - haiku
+  - haiku-x64
+
+# actions/cache and artifact API server
+cache:
+  enabled: true          # start the built-in cache server
+  host: 127.0.0.1        # bind address (loopback recommended)
+  port: 0                # 0 = pick an ephemeral port
+  max_age_days: 7        # purge entries older than N days on daemon startup
+```
+
+---
+
+## Workflow YAML support
+
+### Triggers (`on:`)
+
+All three `on:` forms are parsed and used to validate `act_runner run --event`:
+
+```yaml
+on: push                              # scalar
+on: [push, pull_request]              # sequence
+on:                                   # map with filters
+  push:
+    branches: [main, develop]
+    paths: ['src/**', 'CMakeLists.txt']
+  pull_request:
+    types: [opened, synchronize]
+  release:
+    tags: ['v*']
+```
+
+When you run `act_runner run workflow.yml --event release` and the workflow's
+`on:` block doesn't include `release`, a warning is printed but execution
+proceeds (useful for manual testing).
+
+### Expression language
+
+Full GitHub Actions expression syntax is supported:
+
+```yaml
+# Operators: ==  !=  <  <=  >  >=  &&  ||  !
+if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+
+# Functions
+if: contains(github.ref, 'feature')
+if: startsWith(github.ref, 'refs/tags/v')
+if: endsWith(github.ref, '-stable')
+run: echo "hash=${{ hashFiles('**/package-lock.json') }}"
+run: echo "json=${{ toJSON(github.event) }}"
+
+# Status functions (for post-failure steps)
+if: always()
+if: failure()
+if: success()
+if: cancelled()
+
+# Context access
+run: echo "SHA=${{ github.sha }}"
+run: echo "VAR=${{ env.MY_VAR }}"
+run: echo "Output=${{ steps.build.outputs.artifact }}"
+run: echo "Dep output=${{ needs.build.outputs.version }}"
+```
+
+Null coercion follows the GitHub Actions specification:
+`null == false` → `true`, `null == 0` → `true`, `null == ''` → `true`.
+
+### Job features
+
+```yaml
 jobs:
   build:
     runs-on: haiku
+    timeout-minutes: 60          # job-level timeout
+    continue-on-error: false     # job-level continue-on-error
+    strategy:
+      fail-fast: false           # don't abort sibling jobs on failure
+      max-parallel: 2            # max concurrent jobs within this wave
+      matrix:
+        config: [debug, release]
+        arch: [x64]
+    env:
+      BUILD_TYPE: ${{ matrix.config }}
+    outputs:
+      artifact: ${{ steps.build.outputs.artifact }}
     steps:
-      - name: Check environment
-        run: uname -a && echo "Hello from Haiku!"
-
-      - name: Build project
-        run: |
-          cd $GITHUB_WORKSPACE
-          make -j4
+      - id: build
+        name: Build
+        run: make -j4 CONFIG=${{ matrix.config }}
+        timeout-minutes: 30
+        continue-on-error: false
+        if: success()
+        env:
+          CC: gcc
 ```
+
+### Actions (`uses:`)
+
+```yaml
+steps:
+  # Remote action (fetched from GitHub or configured Gitea instance)
+  - uses: actions/checkout@v4
+
+  # With inputs
+  - uses: actions/cache@v4
+    with:
+      path: ~/.cache
+      key: ${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+
+  # Local composite action in the repo
+  - uses: ./.gitea/actions/my-action
+
+  # Composite actions support recursion (up to depth 10)
+```
+
+> **Docker actions** (`docker://image`) are logged as an error and skipped.
+> Haiku has no Docker runtime.
+
+---
+
+## Writing workflows for Haiku
+
+```yaml
+name: CI on Haiku
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: haiku          # or whatever label you registered with
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: pkgman install -y cmake yaml_cpp_devel curl_devel
+
+      - name: Build
+        run: |
+          mkdir -p build
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -- -j$(nproc)
+        env:
+          HAIKU_VERSION: R1/beta5
+
+      - name: Test
+        run: cmake --build build --target test
+        continue-on-error: false
+```
+
+---
+
+## Running tests
+
+```bash
+cd build
+ctest --output-on-failure      # run all 14 test suites
+ctest -R test_expr_evaluator   # run a single suite
+```
+
+Test suites:
+
+| Suite | What it tests |
+|-------|--------------|
+| `test_expr_evaluator` | 71 expression evaluator unit tests |
+| `test_workflow_parser` | 39 YAML parser tests incl. `on:` triggers |
+| `test_matrix_expander` | Matrix cross-product expansion |
+| `test_env_manager` | `$GITHUB_OUTPUT` / `$GITHUB_ENV` protocol |
+| `test_process_spawner` | Process spawning, pipes, timeouts |
+| `test_job_graph` | Topological sort, cycle detection, wave schedule |
+| `test_context_builder` | Expression context population |
+| `test_runner_client` | Connect-RPC protobuf encode/decode |
+| `test_action_runner` | Local and remote `uses:` action resolution |
+| `test_task_executor` | End-to-end job execution with mock client |
+| `test_cache_server` | Cache and artifact HTTP API (libmicrohttpd) |
+| `test_workflow_orchestrator` | Multi-job wave dispatch + `cancel()` |
+| `test_poller` | FetchTask loop, capacity semaphore, shutdown |
+| `test_main_cli` | Black-box CLI integration tests |
+
+---
 
 ## Architecture
 
 ```
 haiku-act-runner/
 ├── src/
-│   ├── main.cpp                    # CLI: register | daemon
+│   ├── main.cpp                        # CLI, signal handling, watchdog
 │   ├── config/
-│   │   ├── Config.h/.cpp           # yaml-cpp config loading
-│   │   └── RunnerState.h/.cpp      # JSON .runner token persistence
+│   │   ├── Config.h/.cpp               # YAML config (yaml-cpp)
+│   │   └── RunnerState.h/.cpp          # .runner JSON persistence
 │   ├── client/
-│   │   ├── GiteaClient.h/.cpp      # HTTP REST (libcurl)
-│   │   └── RunnerClient.h/.cpp     # Connect-RPC (hand-coded proto + libcurl)
+│   │   ├── GiteaClient.h/.cpp          # HTTP REST (libcurl)
+│   │   ├── RunnerClient.h/.cpp         # Connect-RPC + protobuf (libcurl)
+│   │   ├── IRunnerClient.h             # Abstract interface (testable)
+│   │   ├── LocalRunnerClient.h         # No-op impl for `run` subcommand
+│   │   └── RunnerDtos.h                # Data transfer objects
 │   ├── runner/
-│   │   ├── Poller.h/.cpp           # FetchTask loop + task dispatch
-│   │   ├── TaskExecutor.h/.cpp     # Single job orchestration
-│   │   ├── StepRunner.h/.cpp       # Step execution (posix_spawn)
-│   │   └── LogForwarder.h/.cpp     # Batched UpdateLog streaming
+│   │   ├── Poller.h/.cpp               # FetchTask loop + thread pool
+│   │   ├── TaskExecutor.h/.cpp         # Single-job orchestration
+│   │   ├── StepRunner.h/.cpp           # Step execution
+│   │   ├── LogForwarder.h/.cpp         # Batched log streaming
+│   │   ├── JobGraph.h/.cpp             # Dependency graph / wave schedule
+│   │   └── WorkflowOrchestrator.h/.cpp # Local multi-job execution
 │   ├── process/
-│   │   ├── ProcessSpawner.h/.cpp   # posix_spawn wrapper
-│   │   └── EnvManager.h/.cpp       # GITHUB_OUTPUT/ENV/PATH protocol
-│   └── workflow/
-│       ├── WorkflowParser.h/.cpp   # YAML workflow parsing (yaml-cpp)
-│       ├── ExprEvaluator.h/.cpp    # ${{ }} expression engine
-│       ├── ContextBuilder.h/.cpp   # github/env/runner/steps contexts
-│       └── MatrixExpander.h/.cpp   # Matrix cross-product expansion
+│   │   ├── ProcessSpawner.h/.cpp       # load_image/posix_spawn + pipes
+│   │   └── EnvManager.h/.cpp           # Protocol file management
+│   ├── workflow/
+│   │   ├── WorkflowParser.h/.cpp       # YAML → Workflow struct (yaml-cpp)
+│   │   ├── ExprEvaluator.h/.cpp        # ${{ }} recursive-descent parser
+│   │   ├── ContextBuilder.h/.cpp       # Context population from TaskDto
+│   │   └── MatrixExpander.h/.cpp       # Cross-product + include/exclude
+│   ├── action/
+│   │   └── ActionRunner.h/.cpp         # composite/JS/checkout action support
+│   ├── cache/
+│   │   └── CacheServer.h/.cpp          # cache + artifact HTTP server
+│   └── util/
+│       └── Logger.h/.cpp               # Thread-safe levelled logger
 ├── proto/
-│   └── runner.proto                # Service definition (reference)
-├── vendor/
-│   └── nlohmann/json.hpp           # bundled JSON library
+│   └── runner.proto                    # Gitea RunnerService definition (ref)
+├── tests/                              # 14 test suites
+├── vendor/nlohmann/json.hpp            # Bundled JSON library
+├── haiku-packaging/
+│   ├── act_runner.recipe               # HaikuPorts recipe (local reference)
+│   └── launch_daemon/                  # launch_daemon service descriptor
+├── scripts/
+│   ├── gitea_up.sh                     # Spin up throwaway Gitea in Docker
+│   ├── e2e_smoke.sh                    # End-to-end integration test
+│   └── workflows/                      # Sample workflows for smoke tests
 ├── CMakeLists.txt
 └── config.yaml.example
 ```
 
-## Key Design Decisions
+---
 
-1. **Host executor only** — No Docker on Haiku; steps run directly on host via `posix_spawn()`.
-2. **Connect-RPC over libcurl** — Avoids `gRPC C++` runtime dependency; uses HTTP/1.1 + hand-coded protobuf.
-3. **`posix_spawn()` over `fork()`** — Safer in multi-threaded Haiku process.
-4. **`poll()` (implicit via libcurl)** — No `epoll`/`kqueue` (Linux/BSD only).
-5. **`find_directory()` for paths** — Never hardcodes `/etc/` or `/usr/`.
-6. **`sigaction()` for shutdown** — Avoids Linux-only `signalfd`.
-7. **`std::counting_semaphore`** (C++20) — Capacity limiting for concurrent jobs.
+## Haiku-specific design notes
 
-## Haiku-specific notes
+### Why `load_image()` instead of `posix_spawn()`
 
-- Settings path: `B_USER_SETTINGS_DIRECTORY/act_runner/` → `/boot/home/config/settings/act_runner/`
-- Temp workspaces: `/tmp/act_runner_<task_id>_<random>/`
-- No `epoll`, `inotify`, `/proc`, or `signalfd` — all avoided.
-- Tested with GCC 13/14 (`-std=c++20`) on x86_64 Haiku.
+Haiku's `posix_spawn()` is implemented via an intermediate spawner thread
+created inside the parent team.  When that thread exits after a successful
+`load_image()`, the kernel's thread-exit path can incorrectly deliver
+`SIGKILLTHR` (signal 21, un-catchable) to the parent, killing the daemon.
+
+We use `load_image()` directly — a single kernel syscall that creates the
+child team without any intermediate thread.  A global mutex
+(`s_load_image_mutex`) serialises concurrent spawns to avoid a separate
+race condition present when multiple threads call `load_image()` simultaneously.
+
+### Signal handling
+
+| Signal | Handler |
+|--------|---------|
+| `SIGINT`, `SIGTERM` | Set `g_shutdown` flag → graceful stop |
+| `SIGCHLD` | `SIG_IGN` (child cleanup via `waitpid`) |
+| `SIGSEGV`, `SIGBUS` | `siglongjmp` recovery inside worker (logs error, marks task failed) |
+| `SIGTRAP`, `SIGUSR2` | Benign handler (Haiku `load_image()` internals) |
+
+`signalfd`, `eventfd`, and `timerfd` are Linux-only and are not used.
+
+### Paths
+
+All paths use `find_directory()` (Haiku API) rather than hardcoded prefixes:
+
+| Purpose | Path |
+|---------|------|
+| Config + state | `B_USER_SETTINGS_DIRECTORY/act_runner/` |
+| Job workspaces | `B_SYSTEM_TEMP_DIRECTORY/act_runner_<id>_<hex>/` |
+| Action cache | `B_USER_SETTINGS_DIRECTORY/act_runner/action_cache/` |
+
+---
+
+## Known limitations
+
+| Limitation | Workaround |
+|-----------|-----------|
+| Docker actions (`docker://…`) | Not supported — Haiku has no Docker |
+| `actions/cache` without Node.js | Emits warning, treated as cache miss |
+| JS actions without Node.js | Emits error, step returns failure (or continue-on-error) |
+| `join()` with array values | Stringifies first arg only (GHA arrays not fully modelled) |
+| Reusable workflows (`workflow_call`) | Not yet implemented |
+| OIDC / GitHub-App tokens | Not applicable (Gitea-only runner) |
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+The original [act_runner](https://gitea.com/gitea/act_runner) is also MIT-licensed.

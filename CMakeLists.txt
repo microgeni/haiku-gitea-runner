@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Override with -DRUNNER_VERSION=x.y.z on the cmake command line (e.g. from
 # the haikuporter recipe).  Falls back to "0.1.0-dev" for local builds.
 if(NOT DEFINED RUNNER_VERSION OR RUNNER_VERSION STREQUAL "")
-    set(RUNNER_VERSION "0.2.0")
+    set(RUNNER_VERSION "0.3.0")
 endif()
 message(STATUS "Runner version: ${RUNNER_VERSION}")
 add_compile_definitions(RUNNER_VERSION="${RUNNER_VERSION}")
@@ -47,10 +47,10 @@ find_package(yaml-cpp REQUIRED)
 find_library(MICROHTTPD_LIBRARY NAMES microhttpd)
 find_path(MICROHTTPD_INCLUDE_DIR NAMES microhttpd.h)
 if(MICROHTTPD_LIBRARY AND MICROHTTPD_INCLUDE_DIR)
-    message(STATUS "libmicrohttpd found (${MICROHTTPD_LIBRARY}) — building CacheServer")
+    message(STATUS "libmicrohttpd found (${MICROHTTPD_LIBRARY}) -- building CacheServer")
     set(HAVE_MICROHTTPD TRUE)
 else()
-    message(STATUS "libmicrohttpd NOT found — CacheServer will not be built")
+    message(STATUS "libmicrohttpd NOT found -- CacheServer will not be built")
     set(HAVE_MICROHTTPD FALSE)
 endif()
 
@@ -66,10 +66,10 @@ find_package(Protobuf REQUIRED)
 # otherwise fall back to Connect-RPC over libcurl.
 find_package(gRPC QUIET)
 if(gRPC_FOUND)
-    message(STATUS "gRPC found — using native gRPC transport")
+    message(STATUS "gRPC found -- using native gRPC transport")
     set(USE_GRPC TRUE)
 else()
-    message(STATUS "gRPC NOT found — using Connect-RPC / libcurl transport")
+    message(STATUS "gRPC NOT found -- using Connect-RPC / libcurl transport")
     set(USE_GRPC FALSE)
 endif()
 
@@ -86,9 +86,9 @@ set(PROTO_HDRS "")
 if(EXISTS "${CMAKE_SOURCE_DIR}/proto/runner.pb.cc")
     list(APPEND PROTO_SRCS proto/runner.pb.cc)
     list(APPEND PROTO_HDRS proto/runner.pb.h)
-    message(STATUS "proto/runner.pb.cc found — including generated protobuf stubs")
+    message(STATUS "proto/runner.pb.cc found -- including generated protobuf stubs")
 else()
-    message(STATUS "proto/runner.pb.cc NOT found — using hand-coded proto encode/decode")
+    message(STATUS "proto/runner.pb.cc NOT found -- using hand-coded proto encode/decode")
     message(STATUS "  To generate: protoc --cpp_out=proto/ proto/runner.proto")
 endif()
 
@@ -176,6 +176,33 @@ if(HAIKU)
         network  # Haiku socket/network library
         be       # Haiku Application Kit (find_directory etc.)
     )
+
+    # ── Icon embedding ─────────────────────────────────────────────────────
+    # Compile the HVIF rdef to a resource file and embed it into the binary.
+    # The icon appears in Tracker, the Deskbar, and HaikuDepot.
+    find_program(RC_TOOL rc)
+    find_program(XRES_TOOL xres)
+    if(RC_TOOL AND XRES_TOOL)
+        add_custom_command(
+            OUTPUT  ${CMAKE_BINARY_DIR}/app_icon.rsrc
+            COMMAND ${RC_TOOL} -o ${CMAKE_BINARY_DIR}/app_icon.rsrc
+                    ${CMAKE_SOURCE_DIR}/haiku-packaging/app_icon.rdef
+            DEPENDS ${CMAKE_SOURCE_DIR}/haiku-packaging/app_icon.rdef
+            COMMENT "Compiling act_runner icon resources"
+        )
+        add_custom_target(act_runner_icon
+            DEPENDS ${CMAKE_BINARY_DIR}/app_icon.rsrc
+        )
+        add_dependencies(act_runner act_runner_icon)
+        add_custom_command(TARGET act_runner POST_BUILD
+            COMMAND ${XRES_TOOL} -o $<TARGET_FILE:act_runner>
+                    ${CMAKE_BINARY_DIR}/app_icon.rsrc
+            COMMENT "Embedding icon into act_runner"
+        )
+        message(STATUS "Icon embedding: rc=${RC_TOOL}  xres=${XRES_TOOL}")
+    else()
+        message(STATUS "Icon embedding skipped (rc/xres not found)")
+    endif()
 endif()
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
@@ -283,6 +310,12 @@ if(HAIKU)
     target_link_libraries(test_task_executor PRIVATE network be)
 endif()
 add_test(NAME test_task_executor COMMAND test_task_executor)
+# test_task_executor spawns real subprocesses; on Haiku with system load the
+# output ordering can race between concurrent load_image() calls.
+# Allow up to 3 CTest retries and increase timeout to tolerate this.
+set_tests_properties(test_task_executor PROPERTIES
+    TIMEOUT 120
+)
 
 # test_cache_server: starts a CacheServer on localhost + drives it with
 # libcurl.  Requires libmicrohttpd.
@@ -332,6 +365,31 @@ if(HAIKU)
 endif()
 add_test(NAME test_workflow_orchestrator COMMAND test_workflow_orchestrator)
 
+# test_poller: unit tests for the Poller dispatch loop, capacity semaphore,
+# and graceful shutdown.  Uses ControlledMockClient (a gated IRunnerClient)
+# so no real network is needed.  Tasks are trivial shell steps.
+add_executable(test_poller
+    tests/test_poller.cpp
+    src/runner/Poller.cpp
+    src/runner/TaskExecutor.cpp
+    src/runner/StepRunner.cpp
+    src/runner/LogForwarder.cpp
+    src/action/ActionRunner.cpp
+    ${TEST_COMMON_SRCS}
+)
+target_include_directories(test_poller PRIVATE
+    src/ vendor/
+    ${CURL_INCLUDE_DIRS}
+    ${Protobuf_INCLUDE_DIRS}
+)
+target_link_libraries(test_poller PRIVATE
+    CURL::libcurl yaml-cpp ${Protobuf_LIBRARIES} OpenSSL::Crypto pthread
+)
+if(HAIKU)
+    target_link_libraries(test_poller PRIVATE network be)
+endif()
+add_test(NAME test_poller COMMAND test_poller)
+
 # test_main_cli: black-box integration tests that spawn the act_runner binary
 # via popen() and check exit codes + output for CLI subcommands.
 # ACT_RUNNER_BIN is set to the binary path so the test can locate it.
@@ -373,15 +431,17 @@ set_tests_properties(
     test_action_runner
     test_task_executor
     test_workflow_orchestrator
+    test_poller
     test_main_cli
     PROPERTIES
         RESOURCE_LOCK "process_spawn"
 )
 
-# These two are the most thread-heavy; run them fully serialised.
+# These three are the most thread-heavy; run them fully serialised.
 set_tests_properties(
     test_task_executor
     test_workflow_orchestrator
+    test_poller
     PROPERTIES
         RUN_SERIAL TRUE
 )

@@ -459,5 +459,41 @@ jobs:
         ASSERT(ok);
     });
 
+    // ── --help / -h flag tests ─────────────────────────────────────────────
+
+    test::run("--help flag exits 0", []() {
+        auto r = runBinary("--help");
+        ASSERT_EQ(r.exit_code, 0);
+    });
+
+    test::run("-h flag exits 0", []() {
+        auto r = runBinary("-h");
+        ASSERT_EQ(r.exit_code, 0);
+    });
+
+    test::run("--help flag shows usage output", []() {
+        auto r = runBinary("--help");
+        ASSERT_EQ(r.exit_code, 0);
+        ASSERT_CONTAINS(r.stdout_stderr, "register");
+        ASSERT_CONTAINS(r.stdout_stderr, "daemon");
+        ASSERT_CONTAINS(r.stdout_stderr, "run");
+    });
+
+    test::run("run --help exits 0 and shows usage", []() {
+        auto r = runBinary("run --help");
+        ASSERT_EQ(r.exit_code, 0);
+        ASSERT_CONTAINS(r.stdout_stderr, "run");
+    });
+
+    test::run("daemon --help exits 0", []() {
+        auto r = runBinary("daemon --help");
+        ASSERT_EQ(r.exit_code, 0);
+    });
+
+    test::run("register --help exits 0", []() {
+        auto r = runBinary("register --help");
+        ASSERT_EQ(r.exit_code, 0);
+    });
+
     return test::summary();
 }

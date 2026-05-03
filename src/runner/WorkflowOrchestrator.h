@@ -29,12 +29,14 @@
 #include "../client/IRunnerClient.h"
 #include "../config/Config.h"
 #include "../client/RunnerDtos.h"
+#include "TaskExecutor.h"
 
 #include <string>
 #include <map>
 #include <vector>
 #include <functional>
 #include <atomic>
+#include <mutex>
 
 namespace runner {
 
@@ -88,12 +90,21 @@ public:
     );
 
     /// Signal cancellation (e.g. from SIGINT).
-    void cancel() { cancelled_.store(true); }
+    /// Immediately cancels any currently-running TaskExecutor instances and
+    /// prevents any new waves from starting.
+    void cancel();
 
 private:
     IRunnerClient&      client_;
     const Config&       cfg_;
     std::atomic<bool>   cancelled_{false};
+
+    // Track currently running executors so cancel() can reach them.
+    std::mutex                    executors_mutex_;
+    std::vector<TaskExecutor*>    active_executors_;
+
+    void registerExecutor(TaskExecutor* ex);
+    void unregisterExecutor(TaskExecutor* ex);
 
     /// Create a synthetic TaskDto for local job execution.
     TaskDto makeLocalTask(const std::string& workflow_yaml,

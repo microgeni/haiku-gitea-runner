@@ -191,10 +191,9 @@ int main() {
 
     run("needs.<job>.result populated from task.needs_context", []() {
         TaskDto t = makeTask();
-        StepContextDto sc;
-        sc.id = "build";
-        sc.result = 1; // success
-        t.needs_context.push_back(sc);
+        NeedsContextEntry nc;
+        nc.result = 1; // success
+        t.needs_context.push_back({"build", nc});
 
         ContextBuilder b;
         b.withTask(t);
@@ -204,11 +203,10 @@ int main() {
 
     run("needs.<job>.outputs.* accessible", []() {
         TaskDto t = makeTask();
-        StepContextDto sc;
-        sc.id = "build";
-        sc.result = 1;
-        sc.outputs = {{"version", "1.2.3"}, {"sha", "abc"}};
-        t.needs_context.push_back(sc);
+        NeedsContextEntry nc;
+        nc.result = 1;
+        nc.outputs = {{"version", "1.2.3"}, {"sha", "abc"}};
+        t.needs_context.push_back({"build", nc});
 
         ContextBuilder b;
         b.withTask(t);
@@ -219,10 +217,9 @@ int main() {
 
     run("multiple upstream jobs tracked independently in needs.*", []() {
         TaskDto t = makeTask();
-        StepContextDto a; a.id = "lint";  a.result = 1;
-        StepContextDto b; b.id = "build"; b.result = 2;  // failure
-        b.outputs = {{"artifact", "app.tar"}};
-        t.needs_context = {a, b};
+        NeedsContextEntry na; na.result = 1;
+        NeedsContextEntry nb; nb.result = 2; nb.outputs = {{"artifact", "app.tar"}};
+        t.needs_context = {{"lint", na}, {"build", nb}};
 
         ContextBuilder cb;
         cb.withTask(t);
@@ -234,8 +231,8 @@ int main() {
 
     run("expression 'needs.build.result == success' works", []() {
         TaskDto t = makeTask();
-        StepContextDto sc; sc.id = "build"; sc.result = 1;
-        t.needs_context.push_back(sc);
+        NeedsContextEntry nc; nc.result = 1;
+        t.needs_context.push_back({"build", nc});
         ContextBuilder b;
         b.withTask(t);
         auto ctx = b.build();

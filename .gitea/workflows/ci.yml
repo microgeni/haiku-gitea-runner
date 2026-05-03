@@ -1,0 +1,388 @@
+name: Build and Test
+
+"on":
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build & Test haiku-act-runner
+    runs-on:
+      - haiku-x64
+
+    env:
+      PATH: /boot/system/develop/tools/bin:/bin:/boot/system/non-packaged/bin:/boot/home/config/non-packaged/bin
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Detect release ──────────────────────────────────────────────────
+      - name: Detect release
+        id: info
+        run: |
+          IS_RELEASE="false"
+          VERSION=""
+          if echo "${{ github.ref }}" | grep -q "^refs/tags/v"; then
+            IS_RELEASE="true"
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          fi
+          echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION"       >> $GITHUB_OUTPUT
+          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "Release: $IS_RELEASE, Version: $VERSION, Branch: ${{ github.ref_name }}"
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pkgman install -y -R \
+            curl_devel \
+            yaml_cpp0.8_devel \
+            protobuf_devel \
+            libmicrohttpd_devel \
+            openssl3_devel \
+            cmake
+
+      # ── 4. Fetch vendor headers ────────────────────────────────────────────
+      - name: Fetch vendor headers
+        run: |
+          if [ ! -f vendor/nlohmann/json.hpp ]; then
+            mkdir -p vendor/nlohmann
+            curl -sSL \
+              https://github.com/nlohmann/json/releases/latest/download/json.hpp \
+              -o vendor/nlohmann/json.hpp
+          fi
+
+      # ── 5. Configure ──────────────────────────────────────────────────────
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_CXX_EXTENSIONS=OFF
+
+      # ── 6. Build ───────────────────────────────────────────────────────────
+      - name: Build
+        run: cmake --build build -- -j$(nproc)
+
+      # ── 7. Run tests ───────────────────────────────────────────────────────
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure -j1
+
+      # ── 8. Verify binary ───────────────────────────────────────────────────
+      - name: Verify binary
+        run: |
+          test -f build/act_runner && echo "Binary OK"
+          build/act_runner version
+
+      # ── 9. Deploy (dev builds) ─────────────────────────────────────────────
+      - name: Deploy
+        if: steps.info.outputs.is_release != 'true' && github.ref_name == 'dev' && github.event_name != 'pull_request'
+        run: |
+          echo "=== Installing dev build ==="
+          BINARY="$(pwd)/build/act_runner"
+          # Update run.sh to point at the freshly built binary in the workspace.
+          # The daemon picks up the new binary on its next restart (watchdog).
+          cat > /boot/home/config/settings/act_runner/run.sh <<EOF
+          #!/bin/sh
+          exec ${BINARY} daemon \\
+            >> /boot/home/config/settings/act_runner/daemon.log 2>&1
+          EOF
+          chmod +x /boot/home/config/settings/act_runner/run.sh
+          echo "run.sh updated to: ${BINARY}"
+          echo "=== Deploy complete (daemon will use new binary on next restart) ==="
+
+      # ── 10. Stamp version and build HPKG (release tags only) ──────────────
+      - name: Stamp version and build HPKG
+        if: steps.info.outputs.is_release == 'true'
+        id: hpkg
+        run: |
+          VERSION="${{ steps.info.outputs.version }}"
+          BUILD_NUMBER="${{ github.run_number }}"
+          HPKG_NAME="act_runner-${VERSION}-${BUILD_NUMBER}-x86_64.hpkg"
+
+          git fetch origin --tags --force
+          git checkout -f v${VERSION}
+
+          # Re-run cmake with the release version stamped in
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DRUNNER_VERSION="${VERSION}"
+          cmake --build build -- -j$(nproc)
+
+          echo "Building HPKG act_runner-${VERSION} (build ${BUILD_NUMBER})..."
+
+          # Build the .PackageInfo on the fly if haiku-packaging/ recipe exists
+          if [ -f haiku-packaging/act_runner.recipe ]; then
+            echo "Recipe exists — using haikuporter (if available)"
+            haikuporter --no-system-packages \
+              haiku-packaging/act_runner.recipe 2>/dev/null \
+              || echo "haikuporter not available, packaging manually"
+          fi
+
+          # Manual minimal HPKG using package tool
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/bin"
+          cp build/act_runner "$STAGE/bin/act_runner"
+          cat > "$STAGE/.PackageInfo" <<EOF
+          name			act_runner
+          version			${VERSION}-${BUILD_NUMBER}
+          architecture		x86_64
+          summary			"Gitea Actions runner for Haiku OS"
+          description		"Native C++20 port of the Gitea act_runner — no Docker, no Go toolchain."
+          packager		"Haiku CI"
+          vendor			"Microgeni"
+          licenses		{ "MIT" }
+          copyrights		{ "2024-2026 Microgeni" }
+          provides {
+            act_runner = ${VERSION}-${BUILD_NUMBER}
+            cmd:act_runner = ${VERSION}-${BUILD_NUMBER}
+          }
+          requires {
+            lib:libcurl
+            lib:libyaml_cpp
+            lib:libprotobuf
+            lib:libmicrohttpd
+            lib:libssl
+            lib:libcrypto
+          }
+          EOF
+
+          package create -C "$STAGE" "$HPKG_NAME" 2>/dev/null \
+            || (cd "$STAGE" && zip -r "../$HPKG_NAME" . && cd -)
+          rm -rf "$STAGE"
+
+          [ -f "$HPKG_NAME" ] || { echo "ERROR: $HPKG_NAME not created"; exit 1; }
+          echo "HPKG: $HPKG_NAME"
+          ls -lh "$HPKG_NAME"
+
+          HPKG_SHA256=$(sha256sum "$HPKG_NAME" | cut -d' ' -f1)
+          echo "hpkg_name=$HPKG_NAME"     >> $GITHUB_OUTPUT
+          echo "hpkg_sha256=$HPKG_SHA256" >> $GITHUB_OUTPUT
+
+      # ── 11. Source archive ─────────────────────────────────────────────────
+      - name: Create source archive
+        if: steps.info.outputs.is_release == 'true'
+        id: archive
+        run: |
+          VERSION="${{ steps.info.outputs.version }}"
+          ARCHIVE="haiku-act-runner-${VERSION}.tar.gz"
+          git archive --format=tar.gz \
+            --prefix="haiku-act-runner-${VERSION}/" HEAD > "$ARCHIVE"
+          ARCHIVE_SHA256=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+          echo "archive_name=$ARCHIVE"          >> $GITHUB_OUTPUT
+          echo "archive_sha256=$ARCHIVE_SHA256" >> $GITHUB_OUTPUT
+          echo "Archive: $ARCHIVE  SHA256: $ARCHIVE_SHA256"
+
+      # ── 12. Gitea release ──────────────────────────────────────────────────
+      - name: Upload release to Gitea
+        if: steps.info.outputs.is_release == 'true'
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          VERSION="${{ steps.info.outputs.version }}"
+          TAG="v${VERSION}"
+          REPO="Microgeni/haiku-gitea-runner"
+          API_URL="https://gitea.microgeni.synology.me/api/v1"
+          HPKG_NAME="${{ steps.hpkg.outputs.hpkg_name }}"
+          HPKG_SHA256="${{ steps.hpkg.outputs.hpkg_sha256 }}"
+          ARCHIVE="${{ steps.archive.outputs.archive_name }}"
+          ARCHIVE_SHA256="${{ steps.archive.outputs.archive_sha256 }}"
+
+          # Build release body from CHANGELOG.md if present
+          sed -n "/^## \[${VERSION}\]/,/^## \[/p" CHANGELOG.md \
+            | sed '$ d' > /tmp/release_body.txt 2>/dev/null || true
+          if [ ! -s /tmp/release_body.txt ]; then
+            echo "## haiku-act-runner ${VERSION}" > /tmp/release_body.txt
+          fi
+
+          echo ""                                                    >> /tmp/release_body.txt
+          echo "## Downloads"                                        >> /tmp/release_body.txt
+          echo "- **Haiku package**: \`${HPKG_NAME}\`"              >> /tmp/release_body.txt
+          echo "- **Source**: \`${ARCHIVE}\`"                       >> /tmp/release_body.txt
+          echo ""                                                    >> /tmp/release_body.txt
+          echo "## Installation"                                     >> /tmp/release_body.txt
+          echo "    pkgman install ./${HPKG_NAME}"                   >> /tmp/release_body.txt
+          echo ""                                                    >> /tmp/release_body.txt
+          echo "## Checksums (SHA-256)"                              >> /tmp/release_body.txt
+          echo '```'                                                 >> /tmp/release_body.txt
+          echo "${HPKG_SHA256}  ${HPKG_NAME}"                       >> /tmp/release_body.txt
+          echo "${ARCHIVE_SHA256}  ${ARCHIVE}"                      >> /tmp/release_body.txt
+          echo '```'                                                 >> /tmp/release_body.txt
+
+          # Delete existing release for this tag
+          EXISTING_ID=$(curl -s \
+            -H "Authorization: token $RELEASE_TOKEN" \
+            "$API_URL/repos/$REPO/releases/tags/$TAG" \
+            | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2 || echo "")
+          if [ -n "$EXISTING_ID" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token $RELEASE_TOKEN" \
+              "$API_URL/repos/$REPO/releases/$EXISTING_ID" || true
+            sleep 2
+          fi
+
+          # Create release
+          JSON=$(jq -n \
+            --arg tag  "$TAG" \
+            --arg sha  "${{ github.sha }}" \
+            --arg name "haiku-act-runner $VERSION" \
+            --arg body "$(cat /tmp/release_body.txt)" \
+            '{tag_name:$tag, target_commitish:$sha, name:$name, body:$body, draft:false, prerelease:false}')
+
+          RELEASE=$(curl -s -w "\nHTTP:%{http_code}" -X POST \
+            -H "Authorization: token $RELEASE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$JSON" \
+            "$API_URL/repos/$REPO/releases")
+
+          HTTP_CODE=$(echo "$RELEASE" | grep "^HTTP:" | cut -d: -f2)
+          RELEASE_BODY=$(echo "$RELEASE" | grep -v "^HTTP:")
+          RELEASE_ID=$(echo "$RELEASE_BODY" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+          if [ -z "$RELEASE_ID" ]; then
+            echo "ERROR: Could not create release (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "Release ID: $RELEASE_ID"
+
+          # Write and verify SHA256SUMS
+          echo "$HPKG_SHA256  $HPKG_NAME"    >  SHA256SUMS
+          echo "$ARCHIVE_SHA256  $ARCHIVE"   >> SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          # Upload assets
+          for asset in "$HPKG_NAME" "$ARCHIVE" SHA256SUMS; do
+            [ -f "$asset" ] || { echo "SKIP: $asset not found"; continue; }
+            CT="application/octet-stream"
+            [ "$asset" = "SHA256SUMS" ] && CT="text/plain"
+            echo "Uploading $asset..."
+            RESP=$(curl -s -w "\nHTTP:%{http_code}" -X POST \
+              -H "Authorization: token $RELEASE_TOKEN" \
+              -H "Content-Type: $CT" \
+              --data-binary @"$asset" \
+              "$API_URL/repos/$REPO/releases/$RELEASE_ID/assets?name=$asset")
+            CODE=$(echo "$RESP" | grep "^HTTP:" | cut -d: -f2)
+            echo "$asset -> HTTP $CODE"
+            [ "$CODE" = "201" ] || echo "WARNING: unexpected HTTP $CODE for $asset"
+          done
+          echo "=== Gitea release published: $TAG ==="
+
+      # ── 13. Push to GitHub ─────────────────────────────────────────────────
+      - name: Push to GitHub
+        if: steps.info.outputs.is_release == 'true'
+        env:
+          GH_SSH_KEY: ${{ secrets.GH_SSH_KEY }}
+        run: |
+          if [ -z "$GH_SSH_KEY" ]; then
+            echo "GH_SSH_KEY not set — skipping GitHub mirror"
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$GH_SSH_KEY" > ~/.ssh/github_deploy_orig
+          chmod 600 ~/.ssh/github_deploy_orig
+          if grep -q "BEGIN OPENSSH PRIVATE KEY" ~/.ssh/github_deploy_orig; then
+            ssh-keygen -p -m PEM -f ~/.ssh/github_deploy_orig -N "" -P "" 2>/dev/null \
+              && mv ~/.ssh/github_deploy_orig ~/.ssh/github_deploy \
+              || cp ~/.ssh/github_deploy_orig ~/.ssh/github_deploy
+          else
+            cp ~/.ssh/github_deploy_orig ~/.ssh/github_deploy
+          fi
+          chmod 600 ~/.ssh/github_deploy
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
+            git push --force git@github.com:microgeni/haiku-gitea-runner.git HEAD:main \
+            || echo "WARNING: GitHub push failed (repo may not exist yet)"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
+            git push git@github.com:microgeni/haiku-gitea-runner.git \
+            v${{ steps.info.outputs.version }} \
+            || echo "WARNING: GitHub tag push failed"
+          rm -f ~/.ssh/github_deploy
+
+      # ── 14. GitHub release ─────────────────────────────────────────────────
+      - name: Upload Release to GitHub
+        if: steps.info.outputs.is_release == 'true'
+        env:
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$GH_RELEASE_TOKEN" ]; then
+            echo "GH_RELEASE_TOKEN not set — skipping GitHub release"
+            exit 0
+          fi
+          VERSION="${{ steps.info.outputs.version }}"
+          TAG="v${VERSION}"
+          HPKG_NAME="${{ steps.hpkg.outputs.hpkg_name }}"
+          ARCHIVE="${{ steps.archive.outputs.archive_name }}"
+
+          EXISTING_ID=$(curl -s \
+            -H "Authorization: token $GH_RELEASE_TOKEN" \
+            "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases/tags/$TAG" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+          if [ -n "$EXISTING_ID" ]; then
+            curl -s -X DELETE -H "Authorization: token $GH_RELEASE_TOKEN" \
+              "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases/$EXISTING_ID"
+            sleep 2
+          fi
+
+          JSON_PAYLOAD=$(python3 -c "
+          import json
+          body = open('/tmp/release_body.txt').read()
+          print(json.dumps({'tag_name':'${TAG}','name':'haiku-act-runner ${VERSION}','body':body,'draft':False,'prerelease':False}))
+          ")
+
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GH_RELEASE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "https://api.github.com/repos/microgeni/haiku-gitea-runner/releases")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('upload_url','').split('{')[0])" \
+            2>/dev/null || echo "")
+
+          if [ -n "$UPLOAD_URL" ]; then
+            for asset in "$HPKG_NAME" "$ARCHIVE" SHA256SUMS; do
+              [ -f "$asset" ] || continue
+              CT="application/octet-stream"
+              [ "$asset" = "SHA256SUMS" ] && CT="text/plain"
+              curl -s -X POST \
+                -H "Authorization: token $GH_RELEASE_TOKEN" \
+                -H "Content-Type: $CT" \
+                --data-binary @"$asset" \
+                "${UPLOAD_URL}?name=$asset"
+              echo "$asset uploaded"
+            done
+            echo "=== GitHub release published: $TAG ==="
+          else
+            echo "WARNING: Could not create GitHub release (repo may not exist yet)"
+            echo "$RELEASE_RESPONSE" | head -5
+          fi
+
+      # ── 15. Summary ────────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Build Summary ==="
+          echo "Ref:          ${{ github.ref_name }}"
+          echo "Build:        ${{ github.run_number }}"
+          IS_RELEASE="${{ steps.info.outputs.is_release }}"
+          if [ "$IS_RELEASE" = "true" ]; then
+            echo "Type:         RELEASE v${{ steps.info.outputs.version }}"
+            echo "HPKG:         ${{ steps.hpkg.outputs.hpkg_name }}"
+          else
+            echo "Type:         Development build"
+          fi
+          echo "Status:       ${{ job.status }}"

@@ -20,6 +20,38 @@ WorkflowOrchestrator::WorkflowOrchestrator(IRunnerClient& client,
     , cfg_(cfg)
 {}
 
+// ─── cancel / executor tracking ───────────────────────────────────────────
+
+void WorkflowOrchestrator::cancel() {
+    cancelled_.store(true);
+
+    // Immediately cancel any currently-running TaskExecutors so that in-flight
+    // steps (e.g. a long sleep) are killed without waiting for the current
+    // step's timeout.
+    std::lock_guard<std::mutex> lk(executors_mutex_);
+    for (TaskExecutor* ex : active_executors_) {
+        ex->cancel();
+    }
+}
+
+void WorkflowOrchestrator::registerExecutor(TaskExecutor* ex) {
+    std::lock_guard<std::mutex> lk(executors_mutex_);
+    active_executors_.push_back(ex);
+
+    // If we were already cancelled before this executor was registered,
+    // cancel it immediately so it doesn't start any steps.
+    if (cancelled_.load()) {
+        ex->cancel();
+    }
+}
+
+void WorkflowOrchestrator::unregisterExecutor(TaskExecutor* ex) {
+    std::lock_guard<std::mutex> lk(executors_mutex_);
+    active_executors_.erase(
+        std::remove(active_executors_.begin(), active_executors_.end(), ex),
+        active_executors_.end());
+}
+
 // ─── makeLocalTask ────────────────────────────────────────────────────────
 
 TaskDto WorkflowOrchestrator::makeLocalTask(
@@ -47,13 +79,12 @@ TaskDto WorkflowOrchestrator::makeLocalTask(
 
     // Populate needs_context from completed upstream jobs
     for (auto& [dep_id, dep_result] : completed_jobs) {
-        StepContextDto nc;
-        nc.id     = dep_id;
+        NeedsContextEntry nc;
         nc.result = dep_result.success ? 1 /*RESULT_SUCCESS*/ : 2 /*RESULT_FAILURE*/;
         for (auto& [ok, ov] : dep_result.outputs) {
             nc.outputs.emplace_back(ok, ov);
         }
-        task.needs_context.push_back(std::move(nc));
+        task.needs_context.push_back({dep_id, std::move(nc)});
     }
 
     return task;
@@ -176,7 +207,12 @@ OrchestratorResult WorkflowOrchestrator::run(
 
                     try {
                         TaskExecutor executor(client_, std::move(task), cfg_);
+
+                        // Register so cancel() can reach this executor while it runs.
+                        registerExecutor(&executor);
                         result.success = executor.execute();
+                        unregisterExecutor(&executor);
+
                         // Capture job-level outputs so they can flow into
                         // downstream needs_context for the next wave.
                         for (auto& [k, v] : executor.jobOutputs()) {

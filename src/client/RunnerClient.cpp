@@ -12,6 +12,7 @@
 
 #include "RunnerClient.h"
 
+#include "../util/Logger.h"
 #include <curl/curl.h>
 #include <stdexcept>
 #include <cstring>
@@ -126,6 +127,9 @@ static void skipField(uint32_t wire_type, const uint8_t*& p, const uint8_t* end)
 }
 
 // ─── Specific message encoders ────────────────────────────────────────────
+//
+// Field numbers verified against:
+// https://gitea.com/gitea/actions-proto-go/raw/branch/main/runner/v1/messages.pb.go
 
 // PingRequest { string data = 1; }
 static std::string encodePingRequest(const std::string& data) {
@@ -140,7 +144,7 @@ static std::string decodePingResponse_data(const std::string& bytes) {
     const uint8_t* end = p + bytes.size();
     std::string data;
     while (p < end) {
-        uint64_t tag = decodeVarint(p, end);
+        uint64_t tag       = decodeVarint(p, end);
         uint32_t field     = tag >> 3;
         uint32_t wire_type = tag & 0x7;
         if (field == 1 && wire_type == 2) {
@@ -152,27 +156,40 @@ static std::string decodePingResponse_data(const std::string& bytes) {
     return data;
 }
 
-// RegisterRequest
+// RegisterRequest {
+//   string name         = 1;
+//   string token        = 2;
+//   repeated string agent_labels  = 3;  (deprecated)
+//   repeated string custom_labels = 4;  (deprecated)
+//   string version      = 5;
+//   repeated string labels = 6;
+//   bool   ephemeral    = 7;
+// }
 static std::string encodeRegisterRequest(
     const std::string& token,
     const std::string& name,
     const std::vector<std::string>& labels,
-    const std::string& os,
-    const std::string& arch,
     const std::string& version)
 {
     std::string out;
-    appendString(out, 1, token);
-    appendString(out, 2, name);
-    for (auto& l : labels) appendString(out, 3, l);
-    appendString(out, 4, os);
-    appendString(out, 5, arch);
-    appendString(out, 6, version);
+    appendString(out, 1, name);
+    appendString(out, 2, token);
+    // field 3 (agent_labels) and field 4 (custom_labels) are deprecated — skip
+    appendString(out, 5, version);
+    for (auto& l : labels) appendString(out, 6, l);
+    // ephemeral=false (field 7) — proto3 default, skip
     return out;
 }
 
-// RegisterResponse { string runner_token=1; string uuid=2; string name=3; repeated string labels=4; }
-static RegisterResult decodeRegisterResponse(const std::string& bytes) {
+// Runner {
+//   int64  id     = 1;
+//   string uuid   = 2;
+//   string token  = 3;
+//   string name   = 4;
+//   ...
+//   repeated string labels = 9;
+// }
+static RegisterResult decodeRunner(const std::string& bytes) {
     const uint8_t* p   = reinterpret_cast<const uint8_t*>(bytes.data());
     const uint8_t* end = p + bytes.size();
     RegisterResult r;
@@ -181,24 +198,56 @@ static RegisterResult decodeRegisterResponse(const std::string& bytes) {
         uint32_t field     = tag >> 3;
         uint32_t wire_type = tag & 0x7;
         switch (field) {
-            case 1: r.runner_token = decodeString(p, end); break;
-            case 2: r.uuid         = decodeString(p, end); break;
-            case 3: r.name         = decodeString(p, end); break;
-            case 4: r.labels.push_back(decodeString(p, end)); break;
+            case 2: r.uuid          = decodeString(p, end); break;
+            case 3: r.runner_token  = decodeString(p, end); break;
+            case 4: r.name          = decodeString(p, end); break;
+            case 9: r.labels.push_back(decodeString(p, end)); break;
             default: skipField(wire_type, p, end); break;
         }
     }
     return r;
 }
 
-// FetchTaskRequest { repeated string labels=1; int64 tasks_version=2; }
-static std::string encodeFetchTaskRequest(
-    const std::vector<std::string>& labels,
-    int64_t tasks_version)
+// RegisterResponse { Runner runner = 1; }
+static RegisterResult decodeRegisterResponse(const std::string& bytes) {
+    const uint8_t* p   = reinterpret_cast<const uint8_t*>(bytes.data());
+    const uint8_t* end = p + bytes.size();
+    while (p < end) {
+        uint64_t tag       = decodeVarint(p, end);
+        uint32_t field     = tag >> 3;
+        uint32_t wire_type = tag & 0x7;
+        if (field == 1 && wire_type == 2) {
+            return decodeRunner(decodeString(p, end));
+        }
+        skipField(wire_type, p, end);
+    }
+    return RegisterResult{};
+}
+
+// DeclareRequest { string version = 1; repeated string labels = 2; }
+static std::string encodeDeclareRequest(
+    const std::string& version,
+    const std::vector<std::string>& labels)
 {
     std::string out;
-    for (auto& l : labels) appendString(out, 1, l);
-    appendInt64(out, 2, tasks_version);
+    appendString(out, 1, version);
+    for (auto& l : labels) appendString(out, 2, l);
+    return out;
+}
+
+// DeclareResponse { Runner runner = 1; }
+// (same layout as RegisterResponse — reuse decodeRegisterResponse)
+
+// FetchTaskRequest {
+//   int64 tasks_version = 1;  // optimistic-concurrency version token
+// }
+// NOTE: No labels field in FetchTaskRequest (v0.4.1 proto) — labels are
+// stored server-side on the registered runner and are not sent per-request.
+static std::string encodeFetchTaskRequest(int64_t tasks_version)
+{
+    std::string out;
+    // field 1: int64 tasks_version
+    appendInt64(out, 1, tasks_version);
     return out;
 }
 
@@ -218,6 +267,66 @@ static std::pair<std::string,std::string> decodeMapEntry(const std::string& byte
     return {key, val};
 }
 
+// Decode google.protobuf.Struct into a flat key→value map.
+// Struct { map<string, Value> fields = 1; }
+// Value is a oneof; we only care about string_value (field 3).
+static std::vector<std::pair<std::string,std::string>> decodeStruct(const std::string& bytes) {
+    std::vector<std::pair<std::string,std::string>> result;
+    const uint8_t* p   = reinterpret_cast<const uint8_t*>(bytes.data());
+    const uint8_t* end = p + bytes.size();
+    while (p < end) {
+        uint64_t tag       = decodeVarint(p, end);
+        uint32_t field     = tag >> 3;
+        uint32_t wire_type = tag & 0x7;
+        if (field == 1 && wire_type == 2) {
+            // map entry: key=1 (string), value=2 (Value message)
+            std::string entry_bytes = decodeString(p, end);
+            const uint8_t* ep   = reinterpret_cast<const uint8_t*>(entry_bytes.data());
+            const uint8_t* eend = ep + entry_bytes.size();
+            std::string map_key, map_val;
+            while (ep < eend) {
+                uint64_t etag      = decodeVarint(ep, eend);
+                uint32_t ef        = etag >> 3;
+                uint32_t ewt       = etag & 0x7;
+                if (ef == 1 && ewt == 2) {
+                    map_key = decodeString(ep, eend); // map key
+                } else if (ef == 2 && ewt == 2) {
+                    // Value message — parse for string_value (field 3)
+                    std::string val_bytes = decodeString(ep, eend);
+                    const uint8_t* vp   = reinterpret_cast<const uint8_t*>(val_bytes.data());
+                    const uint8_t* vend = vp + val_bytes.size();
+                    while (vp < vend) {
+                        uint64_t vtag = decodeVarint(vp, vend);
+                        uint32_t vf   = vtag >> 3;
+                        uint32_t vwt  = vtag & 0x7;
+                        if (vf == 3 && vwt == 2) {
+                            map_val = decodeString(vp, vend); // string_value
+                        } else {
+                            skipField(vwt, vp, vend);
+                        }
+                    }
+                } else {
+                    skipField(ewt, ep, eend);
+                }
+            }
+            if (!map_key.empty()) result.push_back({map_key, map_val});
+        } else {
+            skipField(wire_type, p, end);
+        }
+    }
+    return result;
+}
+
+// Task {
+//   int64  id               = 1;
+//   bytes  workflow_payload = 2;
+//   Struct context          = 3;   (google.protobuf.Struct — github context)
+//   map<string,string> secrets = 4;
+//   string machine          = 5;   (deprecated/unused)
+//   map<string,TaskNeed> needs = 6;
+//   map<string,string> vars = 7;
+// }
+// TaskNeed { map<string,string> outputs=1; Result result=2; }
 static TaskDto decodeTask(const std::string& bytes) {
     const uint8_t* p   = reinterpret_cast<const uint8_t*>(bytes.data());
     const uint8_t* end = p + bytes.size();
@@ -229,12 +338,54 @@ static TaskDto decodeTask(const std::string& bytes) {
         switch (field) {
             case 1: t.id = static_cast<int64_t>(decodeVarint(p, end)); break;
             case 2: t.workflow_payload = decodeString(p, end); break;
-            case 3: t.context.push_back(decodeMapEntry(decodeString(p, end))); break;
+            case 3: { // google.protobuf.Struct — github context
+                auto kv = decodeStruct(decodeString(p, end));
+                t.context.insert(t.context.end(), kv.begin(), kv.end());
+                break;
+            }
             case 4: t.secrets.push_back(decodeMapEntry(decodeString(p, end))); break;
-            case 5: t.vars.push_back(decodeMapEntry(decodeString(p, end))); break;
-            case 6: t.gitea_runtime_token = decodeString(p, end); break;
-            case 8: t.timeout = static_cast<int64_t>(decodeVarint(p, end)); break;
-            case 9: t.machine = decodeString(p, end); break;
+            case 5: t.machine = decodeString(p, end); break;
+            case 6: { // needs: map<string, TaskNeed>
+                // map entry: key=1 (string), value=2 (TaskNeed message)
+                std::string entry = decodeString(p, end);
+                const uint8_t* ep   = reinterpret_cast<const uint8_t*>(entry.data());
+                const uint8_t* eend = ep + entry.size();
+                std::string need_job;
+                NeedsContextEntry need_entry;
+                while (ep < eend) {
+                    uint64_t etag = decodeVarint(ep, eend);
+                    uint32_t ef   = etag >> 3;
+                    uint32_t ewt  = etag & 0x7;
+                    if (ef == 1 && ewt == 2) {
+                        need_job = decodeString(ep, eend);
+                    } else if (ef == 2 && ewt == 2) {
+                        // TaskNeed message: outputs=1 (map), result=2 (enum)
+                        std::string need_bytes = decodeString(ep, eend);
+                        const uint8_t* np   = reinterpret_cast<const uint8_t*>(need_bytes.data());
+                        const uint8_t* nend = np + need_bytes.size();
+                        while (np < nend) {
+                            uint64_t ntag = decodeVarint(np, nend);
+                            uint32_t nf   = ntag >> 3;
+                            uint32_t nwt  = ntag & 0x7;
+                            if (nf == 1 && nwt == 2) {
+                                auto kv = decodeMapEntry(decodeString(np, nend));
+                                need_entry.outputs.push_back(kv);
+                            } else if (nf == 2 && nwt == 0) {
+                                need_entry.result = static_cast<int>(decodeVarint(np, nend));
+                            } else {
+                                skipField(nwt, np, nend);
+                            }
+                        }
+                    } else {
+                        skipField(ewt, ep, eend);
+                    }
+                }
+                if (!need_job.empty()) {
+                    t.needs_context.push_back({need_job, need_entry});
+                }
+                break;
+            }
+            case 7: t.vars.push_back(decodeMapEntry(decodeString(p, end))); break;
             default: skipField(wire_type, p, end); break;
         }
     }
@@ -263,17 +414,39 @@ static FetchTaskResult decodeFetchTaskResponse(const std::string& bytes) {
     return r;
 }
 
-// UpdateTaskRequest
+// UpdateTaskRequest {
+//   TaskState state   = 1;
+//   map<string,string> outputs = 2;
+// }
+// TaskState {
+//   int64  id         = 1;
+//   Result result     = 2;
+//   Timestamp started_at = 3;
+//   Timestamp stopped_at = 4;
+//   repeated StepState steps = 5;
+// }
+// StepState {
+//   int64  id         = 1;
+//   Result result     = 2;
+//   Timestamp started_at = 3;
+//   Timestamp stopped_at = 4;
+//   int64  log_index  = 5;
+//   int64  log_length = 6;
+// }
 static std::string encodeUpdateTaskRequest(
     int64_t task_id,
     int state,
     const std::vector<StepStateDto>& steps,
     int64_t started_at_s,
-    int64_t stopped_at_s)
+    int64_t stopped_at_s,
+    const std::vector<std::pair<std::string,std::string>>& outputs = {})
 {
-    std::string out;
-    appendInt64(out, 1, task_id);
-    appendEnum(out, 2, state);
+    // Build TaskState embedded message
+    std::string task_state;
+    appendInt64(task_state, 1, task_id);
+    appendEnum(task_state, 2, state);
+    if (started_at_s) appendMessage(task_state, 3, encodeTimestamp(started_at_s));
+    if (stopped_at_s) appendMessage(task_state, 4, encodeTimestamp(stopped_at_s));
 
     for (auto& s : steps) {
         std::string step;
@@ -283,15 +456,26 @@ static std::string encodeUpdateTaskRequest(
         if (s.stopped_at_s) appendMessage(step, 4, encodeTimestamp(s.stopped_at_s));
         appendInt64(step, 5, s.log_index);
         appendInt64(step, 6, s.log_length);
-        appendMessage(out, 3, step);
+        appendMessage(task_state, 5, step);
     }
 
-    if (started_at_s) appendMessage(out, 4, encodeTimestamp(started_at_s));
-    if (stopped_at_s) appendMessage(out, 5, encodeTimestamp(stopped_at_s));
+    std::string out;
+    appendMessage(out, 1, task_state);
+
+    // outputs map (field 2)
+    for (auto& kv : outputs) {
+        std::string entry;
+        appendString(entry, 1, kv.first);
+        appendString(entry, 2, kv.second);
+        appendMessage(out, 2, entry);
+    }
+
     return out;
 }
 
 static UpdateTaskResult decodeUpdateTaskResponse(const std::string& bytes) {
+    // UpdateTaskResponse { TaskState state=1; repeated string sent_outputs=2; }
+    // We just need to confirm success; extract task_id from TaskState.
     const uint8_t* p   = reinterpret_cast<const uint8_t*>(bytes.data());
     const uint8_t* end = p + bytes.size();
     UpdateTaskResult r;
@@ -299,10 +483,30 @@ static UpdateTaskResult decodeUpdateTaskResponse(const std::string& bytes) {
         uint64_t tag       = decodeVarint(p, end);
         uint32_t field     = tag >> 3;
         uint32_t wire_type = tag & 0x7;
-        switch (field) {
-            case 1: r.task_id = static_cast<int64_t>(decodeVarint(p, end)); break;
-            case 2: r.state   = decodeString(p, end); break;
-            default: skipField(wire_type, p, end); break;
+        if (field == 1 && wire_type == 2) {
+            // TaskState — extract id (field 1) and result (field 2)
+            std::string ts_bytes = decodeString(p, end);
+            const uint8_t* tp   = reinterpret_cast<const uint8_t*>(ts_bytes.data());
+            const uint8_t* tend = tp + ts_bytes.size();
+            while (tp < tend) {
+                uint64_t ttag = decodeVarint(tp, tend);
+                uint32_t tf   = ttag >> 3;
+                uint32_t twt  = ttag & 0x7;
+                if (tf == 1 && twt == 0) {
+                    r.task_id = static_cast<int64_t>(decodeVarint(tp, tend));
+                } else if (tf == 2 && twt == 0) {
+                    int res = static_cast<int>(decodeVarint(tp, tend));
+                    // Result enum: 0=unspecified,1=success,2=failure,3=cancelled,4=skipped
+                    r.state = (res == 1) ? "success" :
+                              (res == 2) ? "failure" :
+                              (res == 3) ? "cancelled" :
+                              (res == 4) ? "skipped" : "unknown";
+                } else {
+                    skipField(twt, tp, tend);
+                }
+            }
+        } else {
+            skipField(wire_type, p, end);
         }
     }
     return r;
@@ -361,8 +565,9 @@ static size_t curlWrite(char* ptr, size_t sz, size_t nmemb, void* ud) {
 struct RunnerClient::Impl {
     std::string      base_url;
     std::string      runner_token;
+    std::string      runner_uuid;
     bool             insecure;
-    mutable std::mutex token_mutex;   // protects runner_token reads/writes
+    mutable std::mutex token_mutex;   // protects runner_token and runner_uuid
 
     // NOTE: We do NOT keep a shared CURL* here.  Each doRPC() call creates
     // its own CURL handle for its own duration — this makes RunnerClient
@@ -385,35 +590,22 @@ void RunnerClient::setRunnerToken(std::string token) {
     impl_->runner_token = std::move(token);
 }
 
+void RunnerClient::setRunnerUUID(std::string uuid) {
+    std::lock_guard<std::mutex> lock(impl_->token_mutex);
+    impl_->runner_uuid = std::move(uuid);
+}
+
 // ─── Connect-RPC framing ──────────────────────────────────────────────────
 
 std::string RunnerClient::encodeRequest(const std::string& proto_bytes) {
-    uint32_t len = static_cast<uint32_t>(proto_bytes.size());
-    std::string out(5, '\0');
-    out[0] = 0x00; // no compression
-    out[1] = (len >> 24) & 0xFF;
-    out[2] = (len >> 16) & 0xFF;
-    out[3] = (len >>  8) & 0xFF;
-    out[4] = (len      ) & 0xFF;
-    out.append(proto_bytes);
-    return out;
+    // Connect-RPC UNARY: request body is just the raw protobuf bytes.
+    // The 5-byte envelope (flag + 4-byte length) is only for streaming RPCs.
+    return proto_bytes;
 }
 
 std::string RunnerClient::decodeResponse(const std::string& raw) {
-    if (raw.size() < 5) {
-        throw std::runtime_error("Connect-RPC response too short (" +
-                                 std::to_string(raw.size()) + " bytes)");
-    }
-    // Byte 0: flags (0x00 = no compression, 0x01 = end-stream for streaming)
-    // uint8_t flags = static_cast<uint8_t>(raw[0]);
-    uint32_t len = (static_cast<uint8_t>(raw[1]) << 24)
-                 | (static_cast<uint8_t>(raw[2]) << 16)
-                 | (static_cast<uint8_t>(raw[3]) <<  8)
-                 | (static_cast<uint8_t>(raw[4])      );
-    if (raw.size() < 5 + len) {
-        throw std::runtime_error("Connect-RPC response body truncated");
-    }
-    return raw.substr(5, len);
+    // Connect-RPC UNARY: response body is just the raw protobuf bytes.
+    return raw;
 }
 
 // ─── Core HTTP dispatch ───────────────────────────────────────────────────
@@ -436,12 +628,13 @@ std::string RunnerClient::doRPC_url(const std::string& service_method,
     if (!curl) throw std::runtime_error("curl_easy_init() failed in doRPC");
 
     // Read shared fields under the token lock
-    std::string base_url, runner_token;
+    std::string base_url, runner_token, runner_uuid;
     bool insecure;
     {
         std::lock_guard<std::mutex> lock(impl_->token_mutex);
         base_url     = impl_->base_url;
         runner_token = impl_->runner_token;
+        runner_uuid  = impl_->runner_uuid;
         insecure     = impl_->insecure;
     }
 
@@ -457,6 +650,10 @@ std::string RunnerClient::doRPC_url(const std::string& service_method,
         std::string tok = "x-runner-token: " + runner_token;
         hdrs = curl_slist_append(hdrs, tok.c_str());
     }
+    if (!runner_uuid.empty()) {
+        std::string uid = "x-runner-uuid: " + runner_uuid;
+        hdrs = curl_slist_append(hdrs, uid.c_str());
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
@@ -466,6 +663,10 @@ std::string RunnerClient::doRPC_url(const std::string& service_method,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response_body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        (long)timeout_s);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // NOSIGNAL: prevent libcurl from sending signals (SIGALRM, SIGPIPE, etc.)
+    // in multithreaded daemons.  Required on Haiku to avoid random signal
+    // delivery to arbitrary threads.
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
     // HTTP/1.1 — avoid HTTP/2 multiplexing complexity for simplicity
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,   CURL_HTTP_VERSION_1_1);
     if (insecure) {
@@ -518,22 +719,35 @@ RegisterResult RunnerClient::registerRunner(
     const std::string& reg_token,
     const std::string& name,
     const std::vector<std::string>& labels,
-    const std::string& os,
-    const std::string& arch,
+    const std::string& /*os*/,
+    const std::string& /*arch*/,
     const std::string& version)
 {
-    auto req  = proto::encodeRegisterRequest(reg_token, name, labels, os, arch, version);
+    auto req  = proto::encodeRegisterRequest(reg_token, name, labels, version);
     auto resp = doRPC("Register", req, 30);
     if (resp.empty()) throw std::runtime_error("Register RPC returned empty response");
     return proto::decodeRegisterResponse(resp);
 }
 
-FetchTaskResult RunnerClient::fetchTask(
+RegisterResult RunnerClient::declare(
     const std::vector<std::string>& labels,
+    const std::string& version)
+{
+    auto req  = proto::encodeDeclareRequest(version, labels);
+    auto resp = doRPC("Declare", req, 30);
+    if (resp.empty()) throw std::runtime_error("Declare RPC returned empty response");
+    // DeclareResponse { Runner runner=1; } — same layout as RegisterResponse
+    return proto::decodeRegisterResponse(resp);
+}
+
+FetchTaskResult RunnerClient::fetchTask(
+    const std::vector<std::string>& /*labels*/,
     int64_t tasks_version,
     int timeout_s)
 {
-    auto req  = proto::encodeFetchTaskRequest(labels, tasks_version);
+    // FetchTaskRequest only has tasks_version (field 1); labels are stored on
+    // the registered runner in Gitea and are not repeated per-request.
+    auto req  = proto::encodeFetchTaskRequest(tasks_version);
     auto resp = doRPC("FetchTask", req, timeout_s);
     if (resp.empty()) return FetchTaskResult{};
     return proto::decodeFetchTaskResponse(resp);
@@ -544,9 +758,10 @@ UpdateTaskResult RunnerClient::updateTask(
     int state,
     const std::vector<StepStateDto>& steps,
     int64_t started_at_s,
-    int64_t stopped_at_s)
+    int64_t stopped_at_s,
+    const std::vector<std::pair<std::string,std::string>>& outputs)
 {
-    auto req  = proto::encodeUpdateTaskRequest(task_id, state, steps, started_at_s, stopped_at_s);
+    auto req  = proto::encodeUpdateTaskRequest(task_id, state, steps, started_at_s, stopped_at_s, outputs);
     auto resp = doRPC("UpdateTask", req, 30);
     if (resp.empty()) return UpdateTaskResult{task_id, ""};
     return proto::decodeUpdateTaskResponse(resp);

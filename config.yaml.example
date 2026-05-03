@@ -40,6 +40,19 @@ insecure: false
 # Log level: "debug" | "info" | "warn" | "error"
 log_level: "info"
 
+# ── Working directory ─────────────────────────────────────────────────────────
+# Root directory under which per-job workspace subdirectories are created.
+# Each job gets its own subdirectory: <work_dir>/act_runner_<id>_<hex>/
+# The downloaded action cache (e.g. actions/checkout) is stored at:
+#   <work_dir>/act_runner_actions/
+# The runner.temp and runner.tool_cache context variables also resolve under
+# this directory so that all job artefacts are self-contained here.
+#
+# If omitted, /tmp is used.  On a multi-user machine, or when you want jobs
+# to use a specific disk/partition, set this to a user-owned path:
+#
+# work_dir: "/Data/Code/act_runner/work"
+
 # ── Cache server ──────────────────────────────────────────────────────────────
 # Built-in local HTTP server implementing the GitHub Actions cache API
 # (actions/cache@v4).  When enabled the runner advertises it to jobs via

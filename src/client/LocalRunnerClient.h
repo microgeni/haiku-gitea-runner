@@ -45,6 +45,16 @@ public:
         return r;
     }
 
+    RegisterResult declare(
+        const std::vector<std::string>& labels,
+        const std::string& /*version*/ = "0.1.0-haiku") override
+    {
+        RegisterResult r;
+        r.runner_token = "local";
+        r.labels       = labels;
+        return r;
+    }
+
     FetchTaskResult fetchTask(
         const std::vector<std::string>& /*labels*/,
         int64_t /*tasks_version*/,
@@ -59,7 +69,8 @@ public:
         int     state,
         const std::vector<StepStateDto>& /*steps*/,
         int64_t /*started_at_s*/ = 0,
-        int64_t /*stopped_at_s*/ = 0) override
+        int64_t /*stopped_at_s*/ = 0,
+        const std::vector<std::pair<std::string,std::string>>& /*outputs*/ = {}) override
     {
         // In local mode we don't report to a server.
         // Just log the state change for debugging.

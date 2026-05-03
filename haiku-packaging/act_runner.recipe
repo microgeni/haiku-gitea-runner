@@ -7,27 +7,28 @@ Actions workflow jobs, and executes them natively on the host (no Docker \
 required).
 
 Features:
-- Full \${{ }} expression language with hashFiles() (SHA-256 via OpenSSL)
-- Composite, JavaScript, and nested action support (uses:, recursion-guarded)
+- Full \${{ }} expression language
+- actions/checkout support (git clone with token auth)
+- Composite and JavaScript action support (uses:, recursion-guarded)
 - Matrix expansion, job-level if: conditions, needs: dependencies
 - Job-level timeout-minutes enforcement
-- GITHUB_TOKEN, GITHUB_JOB, GITHUB_REF_TYPE, RUNNER_ENVIRONMENT env vars
-- GITHUB_OUTPUT / GITHUB_ENV / GITHUB_PATH / GITHUB_STATE file protocols
-- Local HTTP cache server (actions/cache@v4 compatible)
-- Local HTTP artifact server (actions/upload-artifact@v4 / download-artifact@v4,
-  Twirp JSON protocol)
+- Self-restart watchdog (monitors child daemon, restarts on crash)
+- Local HTTP cache server (actions/cache compatible Twirp API)
+- Local HTTP artifact server (actions/upload-artifact / download-artifact)
 - act_runner run: local multi-job workflow execution (no server needed)
-- act_runner unregister: clean local state removal
-- Haiku launch_daemon integration for automatic startup"
+- Haiku launch_daemon integration for automatic startup at login"
 
-HOMEPAGE="https://github.com/yourusername/haiku-act-runner"
+HOMEPAGE="https://github.com/haiku/haiku-act-runner"
 COPYRIGHT="2024-2025 haiku-act-runner contributors"
 LICENSE="MIT"
 REVISION="1"
-# Local build: SOURCE_URI points at the tarball in the port's download/ directory.
-# For a real release, replace with the GitHub archive URL and update CHECKSUM_SHA256.
-SOURCE_URI="file:///Data/Code/Repos/haikuports/net-misc/haiku_act_runner/download/v$portVersion.tar.gz"
-CHECKSUM_SHA256="244f2f749ac315d27edee901a069bd6f6a72eaf4d6ab5cc24b2780c351ebe1e7"
+
+# To build a release tarball:
+#   git archive --prefix=haiku-act-runner-$portVersion/ HEAD \
+#       | gzip > haiku-act-runner-$portVersion.tar.gz
+# Then place it in the port's download/ directory and update CHECKSUM_SHA256.
+SOURCE_URI="https://github.com/haiku/haiku-act-runner/archive/refs/tags/v$portVersion.tar.gz"
+CHECKSUM_SHA256="REPLACE_WITH_ACTUAL_SHA256_OF_RELEASE_TARBALL"
 SOURCE_DIR="haiku-act-runner-$portVersion"
 
 ARCHITECTURES="all !x86_gcc2"
@@ -40,12 +41,13 @@ PROVIDES="
 	cmd:act_runner$secondaryArchSuffix = $portVersion
 	"
 
-# Runtime: libs we NEEDED at link time (from objdump -p act_runner)
-#   libmicrohttpd.so.12  → libmicrohttpd
-#   libcurl.so.4         → curl
-#   libyaml-cpp.so.0.8   → yaml_cpp0.8
-#   libprotobuf.so.31    → protobuf
-#   libcrypto.so.3       → openssl3
+# Runtime dependencies (from: objdump -p act_runner | grep NEEDED)
+#   libcurl.so.4        → curl
+#   libyaml-cpp.so.0.8  → yaml_cpp0.8
+#   libprotobuf.so.31   → protobuf
+#   libmicrohttpd.so.12 → libmicrohttpd
+#   libcrypto.so.3      → openssl3
+#   libbe.so            → haiku (always present)
 REQUIRES="
 	haiku$secondaryArchSuffix
 	lib:libcurl$secondaryArchSuffix
@@ -53,6 +55,7 @@ REQUIRES="
 	lib:libprotobuf$secondaryArchSuffix
 	lib:libmicrohttpd$secondaryArchSuffix
 	lib:libcrypto$secondaryArchSuffix
+	cmd:git
 	"
 
 BUILD_REQUIRES="
@@ -69,6 +72,7 @@ BUILD_PREREQUIRES="
 	cmd:cmake
 	cmd:make
 	cmd:g++$secondaryArchSuffix
+	cmd:git
 	"
 
 defineDebugInfoPackage haiku_act_runner$secondaryArchSuffix \
@@ -78,42 +82,59 @@ BUILD()
 {
 	# nlohmann/json is bundled in vendor/ — no network access needed.
 	# All other deps are resolved via BUILD_REQUIRES above.
+	#
+	# Use -O1 (not -O2/-O3): higher optimisation levels expose a Haiku-specific
+	# UB in GCC 13 that causes silent daemon crashes after task completion.
+	# -O1 + debug info gives a good balance of performance and stability.
 
 	cmake -B build \
 		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g -DNDEBUG" \
 		-DCMAKE_INSTALL_PREFIX="$prefix" \
 		-DCMAKE_INSTALL_DOCDIR="$docDir" \
 		-DCMAKE_CXX_STANDARD=20 \
 		-DCMAKE_CXX_EXTENSIONS=OFF \
 		-DRUNNER_VERSION="$portVersion"
 
-	# Build only the main executable (not test targets)
 	cmake --build build --target act_runner -j"$jobs"
 }
 
 INSTALL()
 {
-	# Install using cmake --install to avoid triggering test builds
 	cmake --install build
 
-	# Install the launch_daemon user-service descriptor.
-	# Haiku's launch_daemon picks this up from $dataDir/user_launch/ and
-	# starts act_runner at login when 'launch_roster start act_runner' is run.
+	# ── Launch_daemon wrapper script ────────────────────────────────────────
+	# Installed to $dataDir/act_runner/act_runner-launch.sh.
+	# The wrapper performs a deeper pre-flight check (config exists AND
+	# uuid + runner_token are non-empty) before exec-ing the daemon, which
+	# prevents crash-looping when the runner hasn't been registered yet.
+	mkdir -p "$dataDir/act_runner"
+	sed "s|@BIN@|$binDir/act_runner|g" \
+		haiku-packaging/launch_daemon/act_runner-launch.sh \
+		> "$dataDir/act_runner/act_runner-launch.sh"
+	chmod 755 "$dataDir/act_runner/act_runner-launch.sh"
+
+	# ── Launch_daemon user-service descriptor ───────────────────────────────
+	# Haiku's user-session launch_daemon scans $dataDir/user_launch/ at login.
+	# NOTE: the correct directory is "user_launch", not "launch" — the latter
+	# is reserved for system-level (root) services.
 	mkdir -p "$dataDir/user_launch"
 	sed \
-		-e "s|@BIN@|$binDir/act_runner|" \
-		haiku-packaging/launch_daemon/act_runner \
-		> "$dataDir/user_launch/act_runner"
+		-e "s|@BIN@|$binDir/act_runner|g" \
+		-e "s|@DATADIR@|$dataDir|g" \
+		haiku-packaging/launch_daemon/act_runner.launch.template \
+		> "$dataDir/user_launch/x-vnd.act-runner"
+
+	# ── Docs ────────────────────────────────────────────────────────────────
+	mkdir -p "$docDir"
+	cp haiku-packaging/launch_daemon/install-service.sh "$docDir/"
+	cp config.yaml.example "$docDir/"
 }
 
 TEST()
 {
-	# Build and run all 12 test suites (226 tests).
-	# No network required — CacheServer and artifact server tests bind
-	# to ephemeral localhost ports.
-	# The test_process_spawner and test_workflow_orchestrator suites use
-	# flaky()/retry_on_flake() wrappers for the known Haiku posix_spawn
-	# SIGKILLTHR race; they are reliable over multiple runs.
+	# Build and run all 14 test suites (318 individual test cases).
+	# No network required — all tests run against mock or localhost servers.
 	cmake --build build -j"$jobs"
-	ctest --test-dir build --output-on-failure -j4
+	ctest --test-dir build --output-on-failure -j1
 }

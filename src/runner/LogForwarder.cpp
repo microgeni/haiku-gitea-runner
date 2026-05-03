@@ -3,6 +3,10 @@
 #include "../util/Logger.h"
 
 #include <chrono>
+#ifdef __HAIKU__
+#include <signal.h>
+#include <pthread.h>
+#endif
 
 namespace runner {
 
@@ -10,14 +14,23 @@ LogForwarder::LogForwarder(IRunnerClient& client,
                              int64_t        task_id,
                              size_t         batch_size,
                              int            flush_interval_ms,
-                             LogCallback    local_cb)
+                             LogCallback    local_cb,
+                             std::vector<std::string> initial_secrets)
     : client_(client)
     , task_id_(task_id)
     , batch_size_(batch_size)
     , flush_interval_ms_(flush_interval_ms)
     , local_cb_(std::move(local_cb))
+    , secrets_(std::move(initial_secrets))   // loaded BEFORE worker starts
 {
-    worker_ = std::thread([this]() { workerLoop(); });
+    worker_ = std::thread([this]() {
+#ifdef __HAIKU__
+        sigset_t block; sigemptyset(&block);
+        sigaddset(&block, SIGKILLTHR);
+        pthread_sigmask(SIG_BLOCK, &block, nullptr);
+#endif
+        workerLoop();
+    });
 }
 
 LogForwarder::~LogForwarder() {

@@ -81,4 +81,32 @@ inline int summary() {
         } \
     } while(0)
 
+/// ASSERT_CONTAINS(haystack, needle) — checks that the string `haystack`
+/// contains `needle` as a substring.
+#define ASSERT_CONTAINS(haystack, needle) \
+    do { \
+        std::string _h = (haystack); \
+        std::string _n = (needle); \
+        if (_h.find(_n) == std::string::npos) { \
+            std::ostringstream _os; \
+            _os << "ASSERT_CONTAINS failed: [" << _n << "] not found in [" \
+                << _h << "] at " << __FILE__ << ":" << __LINE__; \
+            throw std::runtime_error(_os.str()); \
+        } \
+    } while(0)
+
+/// ASSERT_NOT_CONTAINS(haystack, needle) — checks that `haystack` does NOT
+/// contain `needle` as a substring.
+#define ASSERT_NOT_CONTAINS(haystack, needle) \
+    do { \
+        std::string _h = (haystack); \
+        std::string _n = (needle); \
+        if (_h.find(_n) != std::string::npos) { \
+            std::ostringstream _os; \
+            _os << "ASSERT_NOT_CONTAINS failed: [" << _n << "] found in [" \
+                << _h << "] at " << __FILE__ << ":" << __LINE__; \
+            throw std::runtime_error(_os.str()); \
+        } \
+    } while(0)
+
 } // namespace test

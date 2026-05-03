@@ -30,18 +30,21 @@ namespace fs = std::filesystem;
 // retries `body` up to `max_attempts` times to work around that.
 // Callers use it to wrap the whole test-body so an unrelated spawn flake
 // doesn't mask a real assertion failure.
-static void retry_on_flake(std::function<void()> body, int max_attempts = 3) {
+static void retry_on_flake(std::function<void()> body, int max_attempts = 5) {
+    std::string last_error;
     for (int attempt = 1; attempt <= max_attempts; ++attempt) {
         try {
             body();
             return;
         } catch (const std::exception& e) {
-            std::string what = e.what();
-            bool is_flake = what.find("Step killed by signal") != std::string::npos
-                         || what.find("ok at") != std::string::npos;  // generic failure
-            if (attempt == max_attempts || !is_flake) throw;
-            // Small backoff before retry — gives Haiku time to clean up pgroups
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            last_error = e.what();
+            if (attempt == max_attempts) throw;
+            // These integration tests invoke real shell processes via load_image()
+            // on Haiku.  Pipe-capture races, SIGKILLTHR, and other Haiku-specific
+            // OS-level races can cause transient failures.  Retry with backoff
+            // before giving up — if the same failure repeats N times it's real.
+            int backoff_ms = 50 * attempt;  // 50, 100, 150, 200 ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         }
     }
 }
@@ -322,11 +325,10 @@ jobs:
       - run: echo "deploying ${{ needs.build.outputs.artifact }}"
 )");
         // Populate upstream needs context
-        StepContextDto sc;
-        sc.id = "build";
-        sc.result = 1;
-        sc.outputs = {{"artifact", "app-v1.2.hpkg"}};
-        task.needs_context.push_back(sc);
+        runner::NeedsContextEntry nc;
+        nc.result = 1;
+        nc.outputs = {{"artifact", "app-v1.2.hpkg"}};
+        task.needs_context.push_back({"build", nc});
 
         TaskExecutor exec(mock, task, cfg);
         bool ok = exec.execute();

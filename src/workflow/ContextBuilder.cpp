@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include "../util/Logger.h"
 
 namespace runner {
 
@@ -20,6 +21,11 @@ ContextBuilder& ContextBuilder::withRunnerInfo(const std::string& name,
     runner_name_ = name;
     runner_os_   = os;
     runner_arch_ = arch;
+    return *this;
+}
+
+ContextBuilder& ContextBuilder::withWorkDir(const std::string& work_dir) {
+    work_dir_ = work_dir;
     return *this;
 }
 
@@ -95,8 +101,8 @@ ExprContext ContextBuilder::build() const {
     ctx.setString("runner.name",  runner_name_.empty() ? "haiku-runner" : runner_name_);
     ctx.setString("runner.os",    runner_os_.empty()   ? "haiku"        : runner_os_);
     ctx.setString("runner.arch",  runner_arch_.empty() ? "X64"          : runner_arch_);
-    ctx.setString("runner.temp",  "/tmp");
-    ctx.setString("runner.tool_cache", "/tmp/tool_cache");
+    ctx.setString("runner.temp",  work_dir_.empty() ? "/tmp" : work_dir_ + "/tmp");
+    ctx.setString("runner.tool_cache", work_dir_.empty() ? "/tmp/tool_cache" : work_dir_ + "/tool_cache");
 
     // github.token — the Gitea runtime token that actions use for API calls.
     // Exposed as ${{ github.token }} (the canonical reference in published actions).
@@ -129,10 +135,10 @@ ExprContext ContextBuilder::build() const {
     //   needs.<job_id>.result              = "success"|"failure"|...
     //   needs.<job_id>.outputs.<out_name>  = <value>
     if (task_) {
-        for (auto& nc : task_->needs_context) {
-            ctx.setString("needs." + nc.id + ".result", resultName(nc.result));
+        for (auto& [job_id, nc] : task_->needs_context) {
+            ctx.setString("needs." + job_id + ".result", resultName(nc.result));
             for (auto& [ok, ov] : nc.outputs) {
-                ctx.setString("needs." + nc.id + ".outputs." + ok, ov);
+                ctx.setString("needs." + job_id + ".outputs." + ok, ov);
             }
         }
     }

@@ -1,0 +1,55 @@
+# x-vnd.act-runner — Haiku launch_daemon service descriptor for haiku-act-runner
+#
+# Installed to:
+#   (packaged)     ~/config/data/user_launch/x-vnd.act-runner
+#   (non-packaged) ~/config/non-packaged/data/user_launch/x-vnd.act-runner
+#
+# The service is managed by Haiku's user-session launch_daemon.  Use
+# launch_roster(1) to control it:
+#
+#   launch_roster start   x-vnd.act-runner   # start now
+#   launch_roster stop    x-vnd.act-runner   # stop
+#   launch_roster restart x-vnd.act-runner   # restart
+#   launch_roster info    x-vnd.act-runner   # status / PID
+#   launch_roster list                        # all services
+#
+# Before the service will start you must register the runner:
+#
+#   act_runner register \
+#       --url   https://your.gitea.example \
+#       --token <registration-token>       \
+#       --name  $(hostname)                \
+#       --labels haiku:host
+#
+# BIN and DATADIR placeholders are substituted by the recipe INSTALL() function.
+# The wrapper script (DATADIR/act_runner/act_runner-launch.sh) performs
+# a deeper pre-flight check (config exists AND uuid+token are non-empty)
+# before exec-ing the real daemon, so launch_daemon won't crash-loop if
+# the runner hasn't been registered yet.
+
+service x-vnd.act-runner {
+	# Invoke the wrapper; it exec's the real daemon on success.
+	launch @DATADIR@/act_runner/act_runner-launch.sh
+
+	# Working directory — relative paths in config are resolved here.
+	working_directory /boot/home/config/settings/act_runner
+
+	# Propagate HOME so the wrapper can locate config/settings/.
+	env {
+		HOME /boot/home
+	}
+
+	# Wait until the network stack is available before starting.
+	on {
+		network_available
+	}
+
+	# Guard: config file must exist before launch_daemon even tries.
+	# (Deeper content validation is done inside the wrapper script.)
+	require {
+		file /boot/home/config/settings/act_runner/config.yaml
+	}
+
+	# Don't start during Haiku safe-mode boots.
+	no_safemode
+}
