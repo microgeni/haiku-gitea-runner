@@ -14,9 +14,9 @@ namespace fs = std::filesystem;
 
 // Create a temporary directory for test workspace
 static std::string makeTempDir() {
-    std::string tmpl = "/tmp/act_runner_test_XXXXXX";
-    char buf[64];
-    strncpy(buf, tmpl.c_str(), sizeof(buf));
+    // Use a fixed-size array sized to the template + NUL.
+    // mkdtemp replaces the trailing XXXXXX in-place.
+    char buf[] = "/tmp/act_runner_test_XXXXXX";
     char* dir = mkdtemp(buf);
     if (!dir) throw std::runtime_error("mkdtemp failed");
     return dir;
