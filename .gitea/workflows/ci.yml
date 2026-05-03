@@ -92,16 +92,17 @@ jobs:
         if: steps.info.outputs.is_release != 'true' && github.ref_name == 'dev' && github.event_name != 'pull_request'
         run: |
           echo "=== Installing dev build ==="
-          cp build/act_runner /boot/home/config/settings/act_runner/../../../bin/act_runner 2>/dev/null || \
-            cp build/act_runner /boot/home/bin/act_runner 2>/dev/null || \
-            cp build/act_runner /tmp/act_runner_dev
-          echo "=== Restarting runner daemon ==="
-          pkill -TERM -f "act_runner daemon" 2>/dev/null || true
-          sleep 2
-          nohup /boot/home/config/settings/act_runner/run.sh </dev/null \
-            >> /boot/home/config/settings/act_runner/daemon.log 2>&1 &
-          sleep 2
-          echo "=== Daemon restarted ==="
+          BINARY="$(pwd)/build/act_runner"
+          # Update run.sh to point at the freshly built binary in the workspace.
+          # The daemon picks up the new binary on its next restart (watchdog).
+          cat > /boot/home/config/settings/act_runner/run.sh <<EOF
+          #!/bin/sh
+          exec ${BINARY} daemon \\
+            >> /boot/home/config/settings/act_runner/daemon.log 2>&1
+          EOF
+          chmod +x /boot/home/config/settings/act_runner/run.sh
+          echo "run.sh updated to: ${BINARY}"
+          echo "=== Deploy complete (daemon will use new binary on next restart) ==="
 
       # ── 10. Stamp version and build HPKG (release tags only) ──────────────
       - name: Stamp version and build HPKG
@@ -286,6 +287,10 @@ jobs:
         env:
           GH_SSH_KEY: ${{ secrets.GH_SSH_KEY }}
         run: |
+          if [ -z "$GH_SSH_KEY" ]; then
+            echo "GH_SSH_KEY not set — skipping GitHub mirror"
+            exit 0
+          fi
           mkdir -p ~/.ssh
           echo "$GH_SSH_KEY" > ~/.ssh/github_deploy_orig
           chmod 600 ~/.ssh/github_deploy_orig
@@ -299,13 +304,12 @@ jobs:
           chmod 600 ~/.ssh/github_deploy
           ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
           GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
-            git push --force git@github.com:danielbenjaminsson/haiku-gitea-runner.git HEAD:main
+            git push --force git@github.com:danielbenjaminsson/haiku-gitea-runner.git HEAD:main \
+            || echo "WARNING: GitHub push failed (repo may not exist yet)"
           GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
             git push git@github.com:danielbenjaminsson/haiku-gitea-runner.git \
-            :refs/tags/v${{ steps.info.outputs.version }} 2>/dev/null || true
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/github_deploy -o IdentitiesOnly=yes" \
-            git push git@github.com:danielbenjaminsson/haiku-gitea-runner.git \
-            v${{ steps.info.outputs.version }}
+            v${{ steps.info.outputs.version }} \
+            || echo "WARNING: GitHub tag push failed"
           rm -f ~/.ssh/github_deploy
 
       # ── 14. GitHub release ─────────────────────────────────────────────────
@@ -314,6 +318,10 @@ jobs:
         env:
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
         run: |
+          if [ -z "$GH_RELEASE_TOKEN" ]; then
+            echo "GH_RELEASE_TOKEN not set — skipping GitHub release"
+            exit 0
+          fi
           VERSION="${{ steps.info.outputs.version }}"
           TAG="v${VERSION}"
           HPKG_NAME="${{ steps.hpkg.outputs.hpkg_name }}"
@@ -359,8 +367,8 @@ jobs:
             done
             echo "=== GitHub release published: $TAG ==="
           else
-            echo "WARNING: Could not create GitHub release"
-            echo "$RELEASE_RESPONSE"
+            echo "WARNING: Could not create GitHub release (repo may not exist yet)"
+            echo "$RELEASE_RESPONSE" | head -5
           fi
 
       # ── 15. Summary ────────────────────────────────────────────────────────
