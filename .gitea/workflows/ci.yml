@@ -137,7 +137,6 @@ jobs:
           STAGE=$(mktemp -d)
           mkdir -p "$STAGE/bin"
           cp build/act_runner "$STAGE/bin/act_runner"
-          mkdir -p "$STAGE/.PackageInfo"
           cat > "$STAGE/.PackageInfo" <<EOF
           name			act_runner
           version			${VERSION}-${BUILD_NUMBER}
