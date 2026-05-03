@@ -47,7 +47,7 @@ jobs:
       # ── 3. Install dependencies ────────────────────────────────────────────
       - name: Install dependencies
         run: |
-          pkgman install -y \
+          pkgman install -y -R \
             curl_devel \
             yaml_cpp0.8_devel \
             protobuf_devel \

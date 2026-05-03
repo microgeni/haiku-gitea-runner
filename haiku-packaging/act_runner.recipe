@@ -103,17 +103,29 @@ INSTALL()
 {
 	cmake --install build
 
-	# Install the launch_daemon user-service descriptor.
-	# Haiku's launch_daemon scans $dataDir/launch/ (= ~/config/data/launch/)
-	# at login and starts registered services when their conditions are met.
-	# The 'require: file config.yaml' guard prevents crash-looping when the
-	# runner hasn't been registered yet.
-	mkdir -p "$dataDir/launch"
-	sed "s|@BIN@|$binDir/act_runner|" \
-		haiku-packaging/launch_daemon/act_runner.launch.template \
-		> "$dataDir/launch/act_runner.launch"
+	# ── Launch_daemon wrapper script ────────────────────────────────────────
+	# Installed to $dataDir/act_runner/act_runner-launch.sh.
+	# The wrapper performs a deeper pre-flight check (config exists AND
+	# uuid + runner_token are non-empty) before exec-ing the daemon, which
+	# prevents crash-looping when the runner hasn't been registered yet.
+	mkdir -p "$dataDir/act_runner"
+	sed "s|@BIN@|$binDir/act_runner|g" \
+		haiku-packaging/launch_daemon/act_runner-launch.sh \
+		> "$dataDir/act_runner/act_runner-launch.sh"
+	chmod 755 "$dataDir/act_runner/act_runner-launch.sh"
 
-	# Ship the install helper and example config in the docs directory.
+	# ── Launch_daemon user-service descriptor ───────────────────────────────
+	# Haiku's user-session launch_daemon scans $dataDir/user_launch/ at login.
+	# NOTE: the correct directory is "user_launch", not "launch" — the latter
+	# is reserved for system-level (root) services.
+	mkdir -p "$dataDir/user_launch"
+	sed \
+		-e "s|@BIN@|$binDir/act_runner|g" \
+		-e "s|@DATADIR@|$dataDir|g" \
+		haiku-packaging/launch_daemon/act_runner.launch.template \
+		> "$dataDir/user_launch/x-vnd.act-runner"
+
+	# ── Docs ────────────────────────────────────────────────────────────────
 	mkdir -p "$docDir"
 	cp haiku-packaging/launch_daemon/install-service.sh "$docDir/"
 	cp config.yaml.example "$docDir/"

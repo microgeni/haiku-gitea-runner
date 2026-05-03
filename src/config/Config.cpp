@@ -62,6 +62,7 @@ Config loadConfig(const std::string& path) {
 
     // Optional fields
     if (root["runner_token"]) cfg.runner_token = root["runner_token"].as<std::string>();
+    if (root["uuid"])         cfg.uuid         = root["uuid"].as<std::string>();
     if (root["name"])         cfg.name         = root["name"].as<std::string>();
     if (root["capacity"])     cfg.capacity     = root["capacity"].as<int>();
     if (root["fetch_timeout"])  cfg.fetch_timeout  = root["fetch_timeout"].as<int>();
@@ -107,6 +108,7 @@ void saveConfig(const Config& cfg, const std::string& path) {
     out << YAML::BeginMap;
     out << YAML::Key << "gitea_url"    << YAML::Value << cfg.gitea_url;
     out << YAML::Key << "runner_token" << YAML::Value << cfg.runner_token;
+    out << YAML::Key << "uuid"         << YAML::Value << cfg.uuid;
     out << YAML::Key << "name"         << YAML::Value << cfg.name;
     out << YAML::Key << "capacity"     << YAML::Value << cfg.capacity;
     out << YAML::Key << "fetch_timeout"  << YAML::Value << cfg.fetch_timeout;

@@ -25,6 +25,7 @@ struct Config {
 
     // ── Runner identity ───────────────────────────────────────────────────
     std::string name;          ///< display name shown in Gitea UI (default: hostname)
+    std::string uuid;          ///< server-assigned runner UUID (written after registration)
 
     // ── Execution ─────────────────────────────────────────────────────────
     int         capacity = 1;  ///< max concurrent jobs (default 1 for safety)

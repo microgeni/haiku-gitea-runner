@@ -355,6 +355,7 @@ static int cmdRegister(const Args& args) {
 
     cfg.name         = state.name;
     cfg.runner_token = reg.runner_token;
+    cfg.uuid         = reg.uuid;
     try {
         runner::saveConfig(cfg, config_path);
         LOG_INFO("register", "Config saved to: " << config_path);
@@ -557,18 +558,32 @@ static int cmdDaemon(const Args& args) {
         return 1;
     }
 
+    // Load runner state (uuid + token).  Prefer values already embedded in the
+    // config YAML (written by newer `register`); fall back to the separate
+    // .runner JSON file for installs that predate the config-only format.
     std::string state_path = runner::defaultRunnerStatePath();
-    if (!std::filesystem::exists(state_path)) {
-        std::cerr << "Runner state not found: " << state_path << "\n"
-                  << "Run 'act_runner register --url <gitea_url> --token <token>' first.\n";
-        return 1;
-    }
-
     runner::RunnerState state;
-    try {
-        state = runner::loadRunnerState(state_path);
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to load runner state: " << e.what() << "\n";
+
+    if (!cfg.uuid.empty() && !cfg.runner_token.empty()) {
+        // All identity fields are in config.yaml — no .runner file needed.
+        state.token  = cfg.runner_token;
+        state.uuid   = cfg.uuid;
+        state.name   = cfg.name;
+        state.labels = cfg.labelStrings();
+    } else if (std::filesystem::exists(state_path)) {
+        try {
+            state = runner::loadRunnerState(state_path);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load runner state: " << e.what() << "\n";
+            return 1;
+        }
+        // Back-fill config from state so the rest of the daemon uses cfg uniformly.
+        if (cfg.uuid.empty())         cfg.uuid         = state.uuid;
+        if (cfg.runner_token.empty()) cfg.runner_token = state.token;
+        if (cfg.name.empty())         cfg.name         = state.name;
+    } else {
+        std::cerr << "Runner is not registered.\n"
+                  << "Run 'act_runner register --url <gitea_url> --token <token>' first.\n";
         return 1;
     }
 
